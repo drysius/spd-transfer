@@ -68,9 +68,7 @@ impl ControlChannel {
     /// [`ProtoError::Io`] on transport failure, including an oversized length prefix.
     pub async fn recv(&mut self) -> Result<Control, ProtoError> {
         let frame = self.framed.next().await.ok_or(ProtoError::PeerClosed)??;
-        let message =
-            postcard::from_bytes(&frame).map_err(|source| ProtoError::Decode { source })?;
-        Ok(message)
+        decode(&frame)
     }
 
     /// Flushes and closes the sending half, leaving the peer a clean end of stream.
@@ -140,8 +138,20 @@ impl ControlReader {
     /// Same as [`ControlChannel::recv`].
     pub async fn recv(&mut self) -> Result<Control, ProtoError> {
         let frame = self.stream.next().await.ok_or(ProtoError::PeerClosed)??;
-        postcard::from_bytes(&frame).map_err(|source| ProtoError::Decode { source })
+        decode(&frame)
     }
+}
+
+/// Turns one already-framed message back into a [`Control`].
+///
+/// Both halves of the channel decode here, and so does the fuzz target: the bytes a peer
+/// controls should reach exactly one parser, and that parser should be the one under test.
+///
+/// # Errors
+/// [`ProtoError::Decode`] if the bytes are not a message this build understands. Length is
+/// bounded before this point, by the framing.
+pub fn decode(frame: &[u8]) -> Result<Control, ProtoError> {
+    postcard::from_bytes(frame).map_err(|source| ProtoError::Decode { source })
 }
 
 fn encode(message: &Control, max_frame_len_bytes: usize) -> Result<Bytes, ProtoError> {

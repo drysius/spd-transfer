@@ -9,7 +9,7 @@ use spd_core::proto::codec::ProtoError;
 use spd_core::proto::messages::{Control, DeviceId, ErrorCode};
 use spd_core::proto::version::{Features, PROTOCOL_VERSION};
 use spd_core::safety::limits::Limits;
-use spd_core::transport::{TrustPolicy, connect, listen};
+use spd_core::transport::{Authentication, connect, listen};
 
 fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
@@ -20,7 +20,13 @@ async fn peers_negotiate_and_then_talk_over_the_control_stream() {
     let listener_device = DeviceId::random().unwrap();
     let caller_device = DeviceId::random().unwrap();
 
-    let listener = listen(loopback(), listener_device, Limits::DEFAULT).unwrap();
+    let listener = listen(
+        loopback(),
+        listener_device,
+        Authentication::Insecure,
+        Limits::DEFAULT,
+    )
+    .unwrap();
     let address = listener.local_addr().unwrap();
 
     let accepting = tokio::spawn(async move {
@@ -52,7 +58,7 @@ async fn peers_negotiate_and_then_talk_over_the_control_stream() {
     let mut caller = connect(
         address,
         caller_device,
-        TrustPolicy::InsecureNoVerification,
+        &Authentication::Insecure,
         Limits::DEFAULT,
     )
     .await
@@ -61,7 +67,11 @@ async fn peers_negotiate_and_then_talk_over_the_control_stream() {
     // Each side learns who the other is, and both agree on version and features.
     assert_eq!(caller.peer().device, listener_device);
     assert_eq!(caller.peer().negotiated.version, PROTOCOL_VERSION);
-    assert_eq!(caller.peer().negotiated.features, Features::SUPPORTED);
+    assert_eq!(
+        caller.peer().negotiated.features,
+        Features::announced(false),
+        "unpaired peers agree on everything except pairing"
+    );
 
     caller
         .control()
@@ -85,7 +95,7 @@ async fn peers_negotiate_and_then_talk_over_the_control_stream() {
 
     let (seen_device, negotiated, first, hangup) = accepting.await.unwrap();
     assert_eq!(seen_device, caller_device);
-    assert_eq!(negotiated.features, Features::SUPPORTED);
+    assert_eq!(negotiated.features, Features::announced(false));
     assert_eq!(
         first,
         Control::Error {
@@ -101,7 +111,13 @@ async fn peers_negotiate_and_then_talk_over_the_control_stream() {
 
 #[tokio::test]
 async fn a_data_stream_crosses_and_ends_where_the_sender_ended_it() {
-    let listener = listen(loopback(), DeviceId::random().unwrap(), Limits::DEFAULT).unwrap();
+    let listener = listen(
+        loopback(),
+        DeviceId::random().unwrap(),
+        Authentication::Insecure,
+        Limits::DEFAULT,
+    )
+    .unwrap();
     let address = listener.local_addr().unwrap();
 
     let accepting = tokio::spawn(async move {
@@ -113,7 +129,7 @@ async fn a_data_stream_crosses_and_ends_where_the_sender_ended_it() {
     let caller = connect(
         address,
         DeviceId::random().unwrap(),
-        TrustPolicy::InsecureNoVerification,
+        &Authentication::Insecure,
         Limits::DEFAULT,
     )
     .await

@@ -26,6 +26,14 @@ pub struct Limits {
     /// batched, regardless of folder size.
     pub max_manifest_entries: usize,
 
+    /// Largest number of files one transfer may end up wanting.
+    ///
+    /// Separate from `max_manifest_entries`, which bounds one message: a peer can send any
+    /// number of well-sized batches, and the receiver has to remember every file it agreed
+    /// to. Without this, "many small batches" is a way to make the other side allocate
+    /// until it dies.
+    pub max_files: u64,
+
     /// Largest number of path components accepted from a peer.
     pub max_path_depth: usize,
 
@@ -50,6 +58,9 @@ impl Limits {
     pub const DEFAULT: Self = Self {
         max_frame_len_bytes: 4 * 1024 * 1024,
         max_manifest_entries: 2_000,
+        // A million files is a large folder and a few hundred megabytes of bookkeeping;
+        // beyond that a user is better served by an error than by an out-of-memory kill.
+        max_files: 1_000_000,
         max_path_depth: 64,
         max_path_len_bytes: 4_096,
         max_concurrent_streams: 16,
@@ -71,6 +82,7 @@ impl Limits {
         // Widened to u128 so `Duration::as_millis` joins the list without a lossy cast.
         let positive = [
             ("max_manifest_entries", self.max_manifest_entries as u128),
+            ("max_files", u128::from(self.max_files)),
             ("max_path_depth", self.max_path_depth as u128),
             ("max_path_len_bytes", self.max_path_len_bytes as u128),
             (

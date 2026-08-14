@@ -1,0 +1,28 @@
+[package]
+name = "spd-fuzz-targets"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately outside the workspace: `libfuzzer-sys` needs nightly and a sanitizer, and a
+# workspace member that cannot build on stable would take CI down with it. The targets here
+# are three lines each and call straight into `spd-fuzz`, which is in CI.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+spd-fuzz = { path = ".." }
+
+[[bin]]
+name = "decode_control"
+path = "fuzz_targets/decode_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safe_path"
+path = "fuzz_targets/safe_path.rs"
+test = false
+doc = false
+bench = false

@@ -12,17 +12,22 @@ use crate::proto::codec::ProtoError;
 use crate::proto::messages::{DeviceId, RandomnessError};
 use crate::proto::version::{PROTOCOL_VERSION, VersionError};
 use crate::safety::limits::{Limits, LimitsError};
+use crate::transport::pairing::Authentication;
 use crate::transport::session::Session;
-use crate::transport::tls::{self, ServerIdentity, TrustPolicy};
+use crate::transport::tls::{self, ServerIdentity};
 
 /// A bound listener, waiting for peers.
 pub struct Listener {
     endpoint: quinn::Endpoint,
     device: DeviceId,
+    auth: Authentication,
     limits: Limits,
 }
 
 /// Binds a listener on `address`.
+///
+/// `auth` applies to every peer this listener accepts: with a code, each of them proves it
+/// knows the code before anything is written to disk.
 ///
 /// Must be called from inside a Tokio runtime: the endpoint drives its own I/O task.
 ///
@@ -32,6 +37,7 @@ pub struct Listener {
 pub fn listen(
     address: SocketAddr,
     device: DeviceId,
+    auth: Authentication,
     limits: Limits,
 ) -> Result<Listener, TransportError> {
     limits.validate()?;
@@ -45,6 +51,7 @@ pub fn listen(
     Ok(Listener {
         endpoint,
         device,
+        auth,
         limits,
     })
 }
@@ -82,7 +89,7 @@ impl Listener {
 
         timeout(
             self.limits.handshake_timeout,
-            Session::establish_as_server(connection, self.device, &self.limits),
+            Session::establish_as_server(connection, self.device, &self.auth, &self.limits),
         )
         .await
         .map_err(|_elapsed| TransportError::HandshakeTimeout {
@@ -101,14 +108,15 @@ impl Listener {
 /// # Errors
 /// [`TransportError::Limits`] if the limits are inconsistent, [`TransportError::Bind`] if
 /// no local socket is available, [`TransportError::Connection`] if the peer is
-/// unreachable, [`TransportError::HandshakeTimeout`] if it stalls.
+/// unreachable, [`TransportError::HandshakeTimeout`] if it stalls,
+/// [`TransportError::Pairing`] if the code does not match the receiver's.
 pub async fn connect(
     address: SocketAddr,
     device: DeviceId,
-    policy: TrustPolicy,
+    auth: &Authentication,
     limits: Limits,
 ) -> Result<Session, TransportError> {
-    connect_announcing(address, device, policy, limits, PROTOCOL_VERSION).await
+    connect_announcing(address, device, auth, limits, PROTOCOL_VERSION).await
 }
 
 /// [`connect`], with the announced protocol version as a parameter.
@@ -119,7 +127,7 @@ pub async fn connect(
 pub(crate) async fn connect_announcing(
     address: SocketAddr,
     device: DeviceId,
-    policy: TrustPolicy,
+    auth: &Authentication,
     limits: Limits,
     announced_version: u16,
 ) -> Result<Session, TransportError> {
@@ -136,10 +144,11 @@ pub(crate) async fn connect_announcing(
         address: local,
         source,
     })?;
-    endpoint.set_default_client_config(tls::client_config(policy, &limits)?);
+    endpoint.set_default_client_config(tls::client_config(&limits)?);
 
     // The certificate is self-signed, so this name is a label the TLS layer needs rather
-    // than something resolved or verified. Identity comes from pairing, in F7.
+    // than something resolved or verified. Identity comes from the pairing proof, which is
+    // bound to the session this certificate established.
     let connecting = endpoint
         .connect(address, "spd")
         .map_err(|source| TransportError::Connect { address, source })?;
@@ -150,7 +159,7 @@ pub(crate) async fn connect_announcing(
 
     timeout(
         limits.handshake_timeout,
-        Session::establish_as_client(connection, device, &limits, announced_version),
+        Session::establish_as_client(connection, device, auth, &limits, announced_version),
     )
     .await
     .map_err(|_elapsed| TransportError::HandshakeTimeout {
@@ -235,6 +244,41 @@ pub enum TransportError {
     /// A device identifier could not be generated.
     #[error(transparent)]
     Randomness(#[from] RandomnessError),
+
+    /// The peers did not prove they know the same pairing code.
+    #[error(transparent)]
+    Pairing(#[from] crate::transport::pairing::PairingError),
+}
+
+impl TransportError {
+    /// Whether reconnecting could plausibly succeed.
+    ///
+    /// The connection dropping is worth another attempt. Everything a peer *decided* is
+    /// not: a wrong pairing code is wrong every time, and retrying it five times only
+    /// turns one clear refusal into five and hands an attacker four more guesses.
+    pub const fn is_recoverable(&self) -> bool {
+        matches!(
+            self,
+            Self::Connection { .. }
+                | Self::HandshakeTimeout { .. }
+                | Self::Proto(ProtoError::PeerClosed | ProtoError::Io(_))
+        )
+    }
+
+    /// The machine-readable code to put on the wire when refusing a peer over this.
+    ///
+    /// Only the reasons a peer is actually refused with need a distinct code; everything
+    /// else never reaches the wire, and saying `Internal` about it is honest.
+    pub(crate) const fn code(&self) -> crate::proto::messages::ErrorCode {
+        use crate::proto::messages::ErrorCode;
+
+        match self {
+            Self::Pairing(_) => ErrorCode::Unauthorized,
+            Self::Version(_) | Self::UnexpectedMessage { .. } => ErrorCode::ProtocolViolation,
+            Self::Limits(_) => ErrorCode::LimitExceeded,
+            _ => ErrorCode::Internal,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,7 +294,13 @@ mod tests {
     /// a dropped connection.
     #[tokio::test]
     async fn an_incompatible_version_is_refused_on_both_sides() {
-        let listener = listen(loopback(), DeviceId::random().unwrap(), Limits::DEFAULT).unwrap();
+        let listener = listen(
+            loopback(),
+            DeviceId::random().unwrap(),
+            Authentication::Insecure,
+            Limits::DEFAULT,
+        )
+        .unwrap();
         let address = listener.local_addr().unwrap();
 
         let accepting = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
@@ -258,7 +308,7 @@ mod tests {
         let refused = connect_announcing(
             address,
             DeviceId::random().unwrap(),
-            TrustPolicy::InsecureNoVerification,
+            &Authentication::Insecure,
             Limits::DEFAULT,
             PROTOCOL_VERSION + 1,
         )
@@ -290,7 +340,7 @@ mod tests {
         let error = connect(
             unused,
             DeviceId::random().unwrap(),
-            TrustPolicy::InsecureNoVerification,
+            &Authentication::Insecure,
             limits,
         )
         .await

@@ -3,12 +3,17 @@
 //! Integration tests describe *what* should happen; the wiring to get two peers talking
 //! lives here so a test that fails points at behaviour rather than at setup.
 
+// Each test binary compiles this module separately and uses the part of it that its own
+// subject needs. Unused-in-one-binary is the normal state of a shared harness, not a sign
+// that something here has no callers.
+#![allow(dead_code)]
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use spd_core::proto::messages::DeviceId;
 use spd_core::safety::limits::Limits;
-use spd_core::transport::{Listener, Session, TrustPolicy, connect, listen};
+use spd_core::transport::{Authentication, Listener, Session, connect, listen};
 
 /// A directory that deletes itself when the test ends.
 ///
@@ -54,10 +59,14 @@ impl Drop for Scratch {
 }
 
 /// Binds a listener on an ephemeral loopback port.
+///
+/// Unpaired: these tests are about what moves once a session exists, and pairing has its
+/// own suite in `tests/pairing.rs`.
 pub(crate) fn bound_listener(limits: Limits) -> (Listener, SocketAddr) {
     let listener = listen(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         DeviceId::random().unwrap(),
+        Authentication::Insecure,
         limits,
     )
     .unwrap();
@@ -66,12 +75,12 @@ pub(crate) fn bound_listener(limits: Limits) -> (Listener, SocketAddr) {
     (listener, address)
 }
 
-/// Connects to `address` as an unverified peer.
+/// Connects to `address` as an unauthenticated peer.
 pub(crate) async fn dial(address: SocketAddr, limits: Limits) -> Session {
     connect(
         address,
         DeviceId::random().unwrap(),
-        TrustPolicy::InsecureNoVerification,
+        &Authentication::Insecure,
         limits,
     )
     .await

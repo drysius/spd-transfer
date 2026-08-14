@@ -5,10 +5,10 @@
 //! behaves.
 
 mod args;
+mod auth;
 mod doctor;
 mod recv;
 mod send;
-mod trust;
 mod ui;
 
 use anyhow::{Context, Result};

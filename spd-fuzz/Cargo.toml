@@ -1,0 +1,18 @@
+[package]
+name = "spd-fuzz"
+description = "Fuzz harnesses for the two places a peer's bytes reach spd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The harnesses live in a library that builds on stable, so CI compiles and exercises them
+# like any other crate. `spd-fuzz/fuzz` drives the same functions under cargo-fuzz, which
+# needs nightly; see `cargo xtask fuzz`.
+[dependencies]
+spd-core.workspace = true
+
+[lints]
+workspace = true

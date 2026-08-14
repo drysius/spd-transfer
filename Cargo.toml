@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["spd-core", "spd-cli", "xtask"]
+members = ["spd-core", "spd-cli", "spd-fuzz", "xtask"]
+# `spd-fuzz/fuzz` is a cargo-fuzz project: nightly only, so it declares its own workspace
+# and stays out of the stable build. What it calls lives in `spd-fuzz`, which is a member.
+exclude = ["spd-fuzz/fuzz"]
 
 [workspace.package]
 version = "0.1.0"

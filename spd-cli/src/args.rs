@@ -69,8 +69,13 @@ pub(crate) struct SendArgs {
     #[arg(value_name = "ADDRESS")]
     pub(crate) address: SocketAddr,
 
-    /// Accept any peer without verifying who it is. Traffic stays encrypted; nothing
-    /// proves the receiver is the machine you meant. Required until pairing exists.
+    /// The pairing code the receiver is showing. Proves you reached that machine and not
+    /// something answering in its place.
+    #[arg(long, value_name = "CODE", conflicts_with = "insecure")]
+    pub(crate) code: Option<String>,
+
+    /// Accept any peer without proving who it is. Traffic stays encrypted; nothing proves
+    /// the receiver is the machine you meant.
     #[arg(long)]
     pub(crate) insecure: bool,
 
@@ -126,8 +131,13 @@ pub(crate) struct RecvArgs {
     #[arg(long, default_value_t = default_listen_address(), value_name = "ADDRESS")]
     pub(crate) listen: SocketAddr,
 
-    /// Accept any peer without verifying who it is. Traffic stays encrypted; nothing
-    /// proves the sender is who you expect. Required until pairing exists.
+    /// Pairing code to expect, instead of showing a fresh one. Useful when the code has
+    /// to be arranged in advance.
+    #[arg(long, value_name = "CODE", conflicts_with = "insecure")]
+    pub(crate) code: Option<String>,
+
+    /// Accept any peer without proving who it is. Traffic stays encrypted; nothing proves
+    /// the sender is who you expect.
     #[arg(long)]
     pub(crate) insecure: bool,
 

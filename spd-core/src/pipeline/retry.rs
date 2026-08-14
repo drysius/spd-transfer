@@ -18,7 +18,7 @@ use crate::pipeline::send::{SendOptions, SendReport, send_tree};
 use crate::pipeline::{PipelineError, TransferSummary};
 use crate::proto::messages::DeviceId;
 use crate::safety::limits::Limits;
-use crate::transport::{Listener, TrustPolicy, connect};
+use crate::transport::{Authentication, Listener, connect};
 
 /// How long to wait before the first reconnection.
 ///
@@ -93,7 +93,7 @@ impl Default for RetryPolicy {
 pub async fn send_tree_reconnecting(
     address: SocketAddr,
     device: DeviceId,
-    policy: TrustPolicy,
+    auth: &Authentication,
     root: &Path,
     options: SendOptions,
     limits: &Limits,
@@ -102,7 +102,7 @@ pub async fn send_tree_reconnecting(
     let mut attempt = 1;
 
     loop {
-        let outcome = match connect(address, device, policy, *limits).await {
+        let outcome = match connect(address, device, auth, *limits).await {
             Ok(session) => send_tree(session, root, options, limits).await,
             Err(unreachable) => Err(PipelineError::Transport(unreachable)),
         };

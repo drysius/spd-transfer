@@ -108,6 +108,24 @@ pub enum Control {
         device: DeviceId,
     },
 
+    /// The connecting side proving it knows the pairing code.
+    ///
+    /// Sent straight after [`Control::HelloAck`], before anything else is agreed. The proof
+    /// is bound to this TLS session, so it is worth nothing anywhere else.
+    Pair {
+        /// Keyed hash of the session's channel binding.
+        proof: [u8; 32],
+    },
+
+    /// The accepting side proving the same thing back.
+    ///
+    /// Without it, a peer that knows the code cannot tell whether it reached the machine
+    /// the code came from or something relaying to it.
+    PairAck {
+        /// Keyed hash of the session's channel binding.
+        proof: [u8; 32],
+    },
+
     /// One batch of the sender's file list. Always batched, regardless of folder size.
     Manifest {
         /// Batch number, starting at zero.
@@ -178,6 +196,8 @@ impl Control {
         match self {
             Self::Hello { .. } => "Hello",
             Self::HelloAck { .. } => "HelloAck",
+            Self::Pair { .. } => "Pair",
+            Self::PairAck { .. } => "PairAck",
             Self::Manifest { .. } => "Manifest",
             Self::SyncReply { .. } => "SyncReply",
             Self::Transfer { .. } => "Transfer",

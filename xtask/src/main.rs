@@ -15,6 +15,7 @@ fn main() -> ExitCode {
     let result = match task.as_deref() {
         Some("ci") => run_ci(),
         Some("fmt") => run(&["fmt", "--all"]),
+        Some("fuzz") => run_fuzz(env::args().nth(2).as_deref()),
         Some(unknown) => {
             eprintln!("unknown task: {unknown}");
             print_usage();
@@ -38,8 +39,26 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!("usage: cargo xtask <task>");
     eprintln!();
-    eprintln!("  ci    format check, clippy, tests, docs and cargo-deny");
-    eprintln!("  fmt   format the whole workspace in place");
+    eprintln!("  ci            format check, clippy, tests, docs and cargo-deny");
+    eprintln!("  fmt           format the whole workspace in place");
+    eprintln!("  fuzz [target] fuzz the decoder and the path sanitiser (needs nightly)");
+}
+
+/// Runs a fuzz target for as long as the caller leaves it running.
+///
+/// Not part of `ci`: cargo-fuzz needs a nightly toolchain and a sanitizer runtime, and a
+/// check that cannot run on the matrix is not a check. What CI does cover is the harness
+/// itself, in `spd-fuzz`, so the thing this drives cannot rot between runs.
+fn run_fuzz(target: Option<&str>) -> Result<(), String> {
+    if !has_cargo_subcommand("fuzz") {
+        eprintln!("xtask: cargo-fuzz not installed (install: cargo install cargo-fuzz)");
+        eprintln!("xtask: it also needs a nightly toolchain: rustup toolchain install nightly");
+        return Err("cargo fuzz".to_owned());
+    }
+
+    let target = target.unwrap_or("decode_control");
+
+    run(&["fuzz", "run", target, "--fuzz-dir=spd-fuzz/fuzz"])
 }
 
 /// Runs the same steps as CI, stopping at the first failure so the output stays readable.

@@ -11,7 +11,7 @@ use spd_core::safety::limits::Limits;
 use spd_core::transport::listen;
 
 use crate::args::RecvArgs;
-use crate::{trust, ui};
+use crate::{auth, ui};
 
 /// Listens, accepts one peer, receives what it offers.
 ///
@@ -19,9 +19,9 @@ use crate::{trust, ui};
 /// Fails if the address cannot be bound, the destination is not writable, or arrived bytes
 /// do not match the sender's hash.
 pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
-    // Announced here rather than in the transport: the policy applies to the peer this
-    // process is about to accept, and the warning belongs where the user can still stop.
-    let _policy = trust::policy(args.insecure)?;
+    // Resolved here rather than in the transport: the code is shown to the person sitting
+    // at this machine, and a warning belongs where they can still stop.
+    let authentication = auth::for_receiver(args.code.as_deref(), args.insecure)?;
 
     let device = DeviceId::random()?;
     let streams = NonZeroU32::new(args.streams).context("--streams must be at least 1")?;
@@ -50,7 +50,7 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("destination {} is unavailable", args.out.display()))?;
 
-    let listener = listen(args.listen, device, limits)
+    let listener = listen(args.listen, device, authentication, limits)
         .with_context(|| format!("could not listen on {}", args.listen))?;
 
     ui::section("listening");

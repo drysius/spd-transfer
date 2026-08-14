@@ -5,9 +5,11 @@
 //! streams and refusing a peer that does not belong.
 
 pub mod endpoint;
+pub mod pairing;
 pub mod session;
 pub mod tls;
 
 pub use endpoint::{Listener, TransportError, connect, listen};
+pub use pairing::{Authentication, PairingCode, PairingError};
 pub use session::{PeerInfo, Session, SessionParts, Streams};
-pub use tls::{ALPN, TlsError, TrustPolicy};
+pub use tls::{ALPN, TlsError};

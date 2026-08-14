@@ -9,6 +9,7 @@ Peer-to-peer file and folder transfer over QUIC, in Rust. Design and phase list 
 |---|---|---|
 | `spd-core` | protocol, transport, safety, pipeline | no UI dependency: never `clap`, `indicatif`, `anyhow`; errors are `thiserror` |
 | `spd-cli` | binary `spd`: parsing, logging, wording | thin, zero protocol logic; `anyhow` allowed here |
+| `spd-fuzz` | fuzz harnesses for the decoder and `SafeRelPath` | builds on stable so CI covers it; `spd-fuzz/fuzz` is the nightly cargo-fuzz project, outside the workspace |
 | `xtask` | `cargo xtask ci` | dependency-free; the single definition of the pipeline |
 
 ## Commands
@@ -16,6 +17,7 @@ Peer-to-peer file and folder transfer over QUIC, in Rust. Design and phase list 
 ```
 cargo xtask ci      # fmt check + clippy -D warnings + tests + docs + cargo-deny
 cargo xtask fmt     # format in place
+cargo xtask fuzz    # cargo-fuzz over the decoder (needs nightly); [target] to pick one
 cargo run -p spd-cli -- doctor
 ```
 
@@ -42,12 +44,13 @@ docs, error wording). Load them when writing or reviewing Rust.
 
 ## Phase status
 
-F0-F6 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport,
+F0-F7 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport,
 verified transfers (`SafeRelPath`, `.part` plus atomic rename), folder sync with a hash
 cache, parallel transfers (work queue, buffer pool, `--streams`, `--mem-budget-mb`),
 resume (state actor over a journal in `.spd`, offset resume, reconnection with backoff,
-`--attempts`) and zstd compression decided per file (`--no-compress`, `--cpu-jobs`).
-F7 is security - see `PLAN.md §10`.
+`--attempts`), zstd compression decided per file (`--no-compress`, `--cpu-jobs`) and
+pairing (`--code`, proof bound to the TLS session; `--insecure` still exists and still
+warns). F8 is finishing - see `PLAN.md §10`.
 
 Nothing lands for a future phase ahead of time; each phase ends with green CI and a usable
 binary.

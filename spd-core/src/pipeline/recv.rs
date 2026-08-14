@@ -423,9 +423,9 @@ async fn negotiate(
         };
 
         if entries.len() > limits.max_manifest_entries {
-            return Err(PipelineError::UnexpectedMessage {
-                expected: "a manifest batch within the limit",
-                got: "an oversized batch",
+            return Err(PipelineError::TooManyFiles {
+                limit: "max_manifest_entries",
+                max: limits.max_manifest_entries as u64,
             });
         }
 
@@ -441,6 +441,15 @@ async fn negotiate(
             let decision = decide(&entry, local, partial);
 
             if let Decision::Need { from_offset, .. } = decision {
+                // Checked as they accumulate, not per batch: a peer can send any number of
+                // batches that are individually within the limit.
+                if wanted.len() as u64 >= limits.max_files {
+                    return Err(PipelineError::TooManyFiles {
+                        limit: "max_files",
+                        max: limits.max_files,
+                    });
+                }
+
                 wanted.insert(
                     entry.file_id,
                     Wanted {

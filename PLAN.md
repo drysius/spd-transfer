@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F6 (compression) done. F7 (security) next.
+**Status:** F7 (security) done. F8 (finishing) next.
 **Last updated:** 2026-08-14
 
 ---
@@ -299,18 +299,29 @@ out-of-root writing through another door.
 
 ### Authentication
 
-- **Default:** the receiver shows a short pairing code; the sender types it. The code
-  derives the session key (PAKE, or a simple PSK in v1 with a planned upgrade). No correct
-  code, no session.
-- **`--insecure`:** accepts a self-signed certificate with no pairing. Prints a visible
-  warning. Never the silent behaviour.
+- **Default:** the receiver shows a short pairing code; the sender types it. Each side
+  derives a key from the code and proves it knows the key, over material exported from the
+  TLS session - so the proof is worthless in any other session, and a peer in the middle
+  has two of them. No correct code, no session.
+- **`--insecure`:** accepts any peer with no pairing. Prints a visible warning. Never the
+  silent behaviour. Both sides have to choose it: one side pairing and the other not is a
+  refusal, because otherwise "the receiver never asked" is a downgrade an attacker can
+  perform.
+- **Not a PAKE.** The v1 proof is a PSK with channel binding: a recorded session can be
+  attacked offline, so the code carries 50 bits rather than the four digits a PAKE would
+  make safe. Replacing it touches one module and two messages.
 - **Optional TOFU (later phase):** persistent keypair per peer, fingerprint confirmation on
   first connection, automatic reconnection afterwards.
 
 ### Limits (all in `safety/limits.rs`, all configurable)
 
-`max_frame_len_bytes` · `max_manifest_entries` · `max_path_depth` · `max_path_len_bytes` ·
-`max_concurrent_streams` · `handshake_timeout` · `idle_timeout` · `max_file_size_bytes`
+`max_frame_len_bytes` · `max_manifest_entries` · `max_files` · `max_path_depth` ·
+`max_path_len_bytes` · `max_concurrent_streams` · `handshake_timeout` · `idle_timeout` ·
+`max_file_size_bytes`
+
+`max_manifest_entries` bounds one message and `max_files` bounds the whole conversation:
+without the second, a peer sends a million well-sized batches and the receiver allocates
+until it dies.
 
 ---
 
@@ -492,11 +503,26 @@ list - in 0.90 s.
 The uncompressed path is unchanged and stays copy-free: a body crossing as it is gets
 hashed where it was read and written from there. Only compression adds a second buffer.
 
-### F7 - Security
+### F7 - Security - **done**
 Pairing, `--insecure` with a warning, all limits enforced, fuzzing for the decoder and
 `SafeRelPath`, path traversal suite (including the Windows cases).
 **Done when:** fuzzing runs for 1 h without a crash; every traversal vector is rejected; an
 unpaired peer writes nothing to disk.
+Shipped: `transport/pairing.rs` - a ten-character code, a key derived from it, and a proof
+bound to the TLS session by its exported keying material, so a peer in the middle holds two
+sessions and can satisfy neither; `--code` on both sides, with the receiver showing a fresh
+one; `Authentication` replacing `TrustPolicy`, which had one variant and decided nothing;
+`tests/path_safety.rs`, fifteen traversal vectors driven through the real receiver, each
+one refused with an empty destination afterwards; and `spd-fuzz`, whose harnesses build on
+stable and run in CI, with cargo-fuzz targets behind `cargo xtask fuzz`.
+The audit that phase asked for found a real hole: `max_manifest_entries` bounds one
+message, and a peer could send unlimited messages within it. `max_files` bounds what the
+receiver ends up holding.
+Two honest limitations. The proof is a PSK with channel binding, not a PAKE: someone who
+records a session can guess codes against it offline, which is why the code is 50 bits and
+not four digits. And the 1 h fuzz run is a command a human runs (`cargo xtask fuzz`), not
+something CI does - what CI runs is a deterministic sweep of the same harnesses, which
+catches a harness that stopped compiling or started panicking.
 
 ### F8 - Finishing
 Progress bars, `--stats`, bandwidth limit (token bucket), LAN discovery (optional), readable

@@ -96,6 +96,15 @@ pub enum PipelineError {
         msg: String,
     },
 
+    /// The peer offered more files than a transfer is allowed to hold.
+    #[error("the peer offered more files than the {max} allowed by {limit}")]
+    TooManyFiles {
+        /// Name of the limit, as the user would set it.
+        limit: &'static str,
+        /// Configured ceiling.
+        max: u64,
+    },
+
     /// A file exceeds the configured ceiling.
     #[error("{path} is {size} B, above the {max} B limit (max_file_size_bytes)")]
     FileTooLarge {
@@ -166,14 +175,14 @@ impl PipelineError {
     /// True for anything that is the connection's fault: what is already on disk stays a
     /// valid prefix, so a second attempt resumes rather than starting over. False for
     /// everything a retry would only repeat - a refused path, a failing disk, a peer
-    /// speaking nonsense, or bytes that arrived and did not match.
+    /// speaking nonsense, a pairing code that does not match, or bytes that arrived and
+    /// did not match.
     pub const fn is_recoverable(&self) -> bool {
-        matches!(
-            self,
-            Self::Stream { .. }
-                | Self::Transport(_)
-                | Self::Proto(ProtoError::PeerClosed | ProtoError::Io(_))
-        )
+        match self {
+            Self::Stream { .. } | Self::Proto(ProtoError::PeerClosed | ProtoError::Io(_)) => true,
+            Self::Transport(transport) => transport.is_recoverable(),
+            _ => false,
+        }
     }
 }
 
@@ -191,6 +200,18 @@ mod tests {
 
         assert!(lost.is_recoverable());
         assert!(PipelineError::Proto(ProtoError::PeerClosed).is_recoverable());
+    }
+
+    #[test]
+    fn a_pairing_code_that_does_not_match_is_not_retried() {
+        let refused = PipelineError::Transport(TransportError::Pairing(
+            crate::transport::PairingError::Mismatch,
+        ));
+
+        assert!(
+            !refused.is_recoverable(),
+            "a wrong code is wrong every time, and retrying it is four more guesses"
+        );
     }
 
     #[test]

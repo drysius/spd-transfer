@@ -10,7 +10,7 @@ use spd_core::proto::messages::DeviceId;
 use spd_core::safety::limits::Limits;
 
 use crate::args::SendArgs;
-use crate::{trust, ui};
+use crate::{auth, ui};
 
 /// Connects, offers the tree, sends whatever the receiver asks for.
 ///
@@ -18,7 +18,7 @@ use crate::{trust, ui};
 /// Fails if the peer is unreachable, the tree cannot be read, or the receiver reports that
 /// a hash did not match.
 pub(crate) async fn run(args: &SendArgs) -> Result<()> {
-    let policy = trust::policy(args.insecure)?;
+    let authentication = auth::for_sender(args.code.as_deref(), args.insecure)?;
     let device = DeviceId::random()?;
 
     let streams = NonZeroU32::new(args.streams).context("--streams must be at least 1")?;
@@ -58,7 +58,7 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
     let report = send_tree_reconnecting(
         args.address,
         device,
-        policy,
+        &authentication,
         &args.file,
         options,
         &limits,

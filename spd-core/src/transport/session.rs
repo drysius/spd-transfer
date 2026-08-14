@@ -11,10 +11,13 @@ use quinn::{Connection, RecvStream, SendStream};
 use tokio::time::timeout;
 
 use crate::proto::codec::{ControlChannel, ControlReader, ControlWriter};
-use crate::proto::messages::{Control, DeviceId, ErrorCode};
+use crate::proto::messages::{Control, DeviceId};
 use crate::proto::version::{Features, Negotiated, PROTOCOL_VERSION, negotiate};
 use crate::safety::limits::Limits;
 use crate::transport::endpoint::TransportError;
+use crate::transport::pairing::{
+    Authentication, BINDING_BYTES, BINDING_LABEL, PairingError, Proof, Side,
+};
 
 /// Who is on the other end, and what was agreed with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +62,7 @@ impl Session {
     pub(crate) async fn establish_as_client(
         connection: Connection,
         device: DeviceId,
+        auth: &Authentication,
         limits: &Limits,
         announced_version: u16,
     ) -> Result<Self, TransportError> {
@@ -67,8 +71,11 @@ impl Session {
             .await
             .map_err(|source| TransportError::Connection { source })?;
 
+        let announced = Features::announced(auth.requires_pairing());
         let mut control = ControlChannel::new(send, recv, limits);
-        control.send(&hello(device, announced_version)).await?;
+        control
+            .send(&hello(device, announced, announced_version))
+            .await?;
 
         match control.recv().await? {
             Control::HelloAck {
@@ -76,7 +83,35 @@ impl Session {
                 features,
                 device: peer_device,
             } => {
-                let agreed = negotiate(version, features)?;
+                let agreed = negotiate(version, features, announced)?;
+                agree_on_pairing(auth, features)?;
+
+                if let Some(code) = auth.code() {
+                    let binding = channel_binding(&connection)?;
+                    let mine = Proof::compute(code, Side::Caller, &binding);
+                    control
+                        .send(&Control::Pair {
+                            proof: mine.bytes(),
+                        })
+                        .await?;
+
+                    let theirs = Proof::compute(code, Side::Answerer, &binding);
+                    match control.recv().await? {
+                        Control::PairAck { proof } => theirs.verify(proof)?,
+                        Control::Error { code, msg } => {
+                            return Err(TransportError::PeerRefused { code, msg });
+                        }
+                        other => {
+                            return Err(TransportError::UnexpectedMessage {
+                                expected: "PairAck",
+                                got: other.kind(),
+                            });
+                        }
+                    }
+
+                    tracing::info!(%peer_device, "paired");
+                }
+
                 Ok(Self::assemble(
                     connection,
                     control,
@@ -102,6 +137,7 @@ impl Session {
     pub(crate) async fn establish_as_server(
         connection: Connection,
         device: DeviceId,
+        auth: &Authentication,
         limits: &Limits,
     ) -> Result<Self, TransportError> {
         let (send, recv) = connection
@@ -109,6 +145,7 @@ impl Session {
             .await
             .map_err(|source| TransportError::Connection { source })?;
 
+        let announced = Features::announced(auth.requires_pairing());
         let mut control = ControlChannel::new(send, recv, limits);
 
         let opening = control.recv().await?;
@@ -126,33 +163,38 @@ impl Session {
 
         // Negotiate before answering: a peer on another protocol version gets a typed
         // rejection instead of an ack it would misread.
-        let agreed = match negotiate(version, features) {
+        let agreed = match negotiate(version, features, announced) {
             Ok(agreed) => agreed,
             Err(refusal) => {
-                // Best effort courtesy: tell the peer why, so it can print something
-                // better than a dropped connection. The refusal itself is what
-                // propagates, so a failure to deliver it changes nothing here.
-                if let Err(undeliverable) = control
-                    .send(&Control::Error {
-                        code: ErrorCode::ProtocolViolation,
-                        msg: refusal.to_string(),
-                    })
-                    .await
-                {
-                    tracing::debug!(%undeliverable, "could not tell the peer why it was refused");
-                }
-                linger_until_peer_leaves(&connection, &mut control, limits).await;
-                return Err(refusal.into());
+                let refusal = TransportError::from(refusal);
+                refuse(&connection, &mut control, &refusal, limits).await;
+                return Err(refusal);
             }
         };
+
+        // Whether the caller is pairing is settled before the ack, so a peer that will
+        // never be let in is told why instead of being invited to send a manifest first.
+        if let Err(refusal) = agree_on_pairing(auth, features) {
+            refuse(&connection, &mut control, &refusal, limits).await;
+            return Err(refusal);
+        }
 
         control
             .send(&Control::HelloAck {
                 version: PROTOCOL_VERSION,
-                features: Features::SUPPORTED.bits(),
+                features: announced.bits(),
                 device,
             })
             .await?;
+
+        if let Some(code) = auth.code() {
+            if let Err(refusal) = Self::prove_to_caller(&connection, &mut control, code).await {
+                refuse(&connection, &mut control, &refusal, limits).await;
+                return Err(refusal);
+            }
+
+            tracing::info!(%peer_device, "paired");
+        }
 
         Ok(Self::assemble(
             connection,
@@ -161,6 +203,38 @@ impl Session {
             peer_device,
             limits,
         ))
+    }
+
+    /// Checks the caller's proof and answers with this side's own.
+    ///
+    /// Both directions matter: the caller's proof says it knows the code, and the answer
+    /// says the machine that showed the code is the machine that received the files.
+    async fn prove_to_caller(
+        connection: &Connection,
+        control: &mut ControlChannel,
+        code: &crate::transport::pairing::PairingCode,
+    ) -> Result<(), TransportError> {
+        let binding = channel_binding(connection)?;
+
+        let theirs = Proof::compute(code, Side::Caller, &binding);
+        match control.recv().await? {
+            Control::Pair { proof } => theirs.verify(proof)?,
+            other => {
+                return Err(TransportError::UnexpectedMessage {
+                    expected: "Pair",
+                    got: other.kind(),
+                });
+            }
+        }
+
+        let mine = Proof::compute(code, Side::Answerer, &binding);
+        control
+            .send(&Control::PairAck {
+                proof: mine.bytes(),
+            })
+            .await?;
+
+        Ok(())
     }
 
     /// Who this session is with.
@@ -256,6 +330,72 @@ impl Session {
             limits: *limits,
         }
     }
+}
+
+/// Tells the peer why it is being refused, then waits for it to read that and leave.
+///
+/// Best effort courtesy: the refusal is already decided, and a peer that has stopped
+/// listening changes nothing about it. What this buys is an error message on the other
+/// machine that names the problem instead of "connection lost".
+async fn refuse(
+    connection: &Connection,
+    control: &mut ControlChannel,
+    refusal: &TransportError,
+    limits: &Limits,
+) {
+    if let Err(undeliverable) = control
+        .send(&Control::Error {
+            code: refusal.code(),
+            msg: refusal.to_string(),
+        })
+        .await
+    {
+        tracing::debug!(%undeliverable, "could not tell the peer why it was refused");
+    }
+
+    linger_until_peer_leaves(connection, control, limits).await;
+}
+
+/// Whether both sides are pairing, or neither is.
+///
+/// One of each is a misconfiguration and not something to paper over: a sender told to
+/// prove a code must not silently accept a receiver that never asks for one, which is
+/// exactly the downgrade an attacker in the middle would attempt.
+fn agree_on_pairing(auth: &Authentication, peer_features: u64) -> Result<(), TransportError> {
+    let peer_pairs = Features::from_bits_truncate(peer_features).contains(Features::PAIRING);
+
+    match (auth.requires_pairing(), peer_pairs) {
+        (true, true) | (false, false) => Ok(()),
+        (true, false) => Err(PairingError::Disagreement {
+            ours: "expects",
+            theirs: "was not given",
+        }
+        .into()),
+        (false, true) => Err(PairingError::Disagreement {
+            ours: "was not given",
+            theirs: "expects",
+        }
+        .into()),
+    }
+}
+
+/// Bytes unique to this TLS session, which both ends can derive and nobody else can.
+///
+/// This is what ties a pairing proof to the connection it travels on: a peer in the middle
+/// has two sessions and therefore two different bindings, so a proof from one is not the
+/// proof the other expects.
+fn channel_binding(connection: &Connection) -> Result<[u8; BINDING_BYTES], TransportError> {
+    let mut binding = [0_u8; BINDING_BYTES];
+
+    connection
+        .export_keying_material(&mut binding, BINDING_LABEL, b"")
+        .map_err(|_too_short| {
+            TransportError::from(PairingError::Unbindable {
+                reason: "the TLS session exported no keying material",
+            })
+        })?;
+
+    Ok(binding)
 }
 
 /// Keeps a refused connection alive just long enough for the peer to read the refusal.
@@ -354,10 +494,10 @@ impl Streams {
     }
 }
 
-fn hello(device: DeviceId, version: u16) -> Control {
+fn hello(device: DeviceId, announced: Features, version: u16) -> Control {
     Control::Hello {
         version,
-        features: Features::SUPPORTED.bits(),
+        features: announced.bits(),
         device,
     }
 }

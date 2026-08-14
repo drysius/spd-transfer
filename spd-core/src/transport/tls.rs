@@ -1,8 +1,10 @@
-//! TLS material and the policy that decides whether a peer is trusted.
+//! TLS material: a certificate for the listener, and a client that accepts it.
 //!
 //! QUIC mandates TLS 1.3, so there is no plaintext mode and no second, unencrypted code
-//! path to keep in sync. What varies is *verification*: [`TrustPolicy`] chooses how the
-//! peer's certificate is judged, and every variant has to be asked for explicitly.
+//! path to keep in sync. The certificate is self-signed and generated per run, so there is
+//! nothing to verify it against and nothing for a policy to choose between. Who the peer is
+//! comes from [`crate::transport::Authentication`], whose proof is bound to the session
+//! this material establishes.
 
 use std::sync::Arc;
 
@@ -52,18 +54,6 @@ impl ServerIdentity {
     }
 }
 
-/// How the connecting side decides whether to trust the listener.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TrustPolicy {
-    /// Accept any certificate without verification.
-    ///
-    /// Traffic is still encrypted - QUIC has no plaintext mode - but nothing proves who
-    /// is on the other end, so this is a LAN convenience and never a default. The CLI
-    /// surfaces it as `--insecure` with a visible warning; pairing lands in F7.
-    InsecureNoVerification,
-}
-
 /// Builds the listener's QUIC configuration.
 ///
 /// # Errors
@@ -91,25 +81,25 @@ pub fn server_config(
     Ok(config)
 }
 
-/// Builds the connecting side's QUIC configuration under a trust policy.
+/// Builds the connecting side's QUIC configuration.
+///
+/// The certificate is always accepted without verification, and that is not a policy knob:
+/// a receiver's certificate is self-signed and generated for the run, so there is nothing
+/// to verify it against. What proves who is on the other end is
+/// [`crate::transport::Authentication`], whose proof is bound to the very TLS session this
+/// certificate established - so a substituted certificate breaks the proof rather than
+/// passing unnoticed.
 ///
 /// # Errors
 /// [`TlsError::Rustls`] if the TLS configuration is rejected, [`TlsError::Quic`] if QUIC
 /// cannot accept it.
-pub fn client_config(
-    policy: TrustPolicy,
-    limits: &Limits,
-) -> Result<quinn::ClientConfig, TlsError> {
-    let mut tls = match policy {
-        TrustPolicy::InsecureNoVerification => {
-            rustls::ClientConfig::builder_with_provider(provider())
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(|source| TlsError::Rustls { source })?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAnyPeer::new()))
-                .with_no_client_auth()
-        }
-    };
+pub fn client_config(limits: &Limits) -> Result<quinn::ClientConfig, TlsError> {
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|source| TlsError::Rustls { source })?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyPeer::new()))
+        .with_no_client_auth();
 
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
@@ -270,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn insecure_client_config_builds() {
-        assert!(client_config(TrustPolicy::InsecureNoVerification, &Limits::DEFAULT).is_ok());
+    fn a_client_config_builds() {
+        assert!(client_config(&Limits::DEFAULT).is_ok());
     }
 }
