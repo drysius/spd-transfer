@@ -104,7 +104,44 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
         stats::print(&progress.snapshot(), elapsed);
     }
 
+    report_unportable(&report.unportable);
+
     Ok(())
+}
+
+/// How many unsendable names are listed before the rest become a count.
+///
+/// Enough to recognise a pattern - one plugin's temporary directory, one bad export - and
+/// few enough not to bury the summary above them.
+const NAMES_SHOWN: usize = 10;
+
+/// Says which files were never offered, and why.
+///
+/// Printed after the summary rather than logged during the scan: a warning that scrolled
+/// past twenty thousand files ago is a warning nobody saw.
+fn report_unportable(unportable: &[spd_core::scan::walk::Unportable]) {
+    if unportable.is_empty() {
+        return;
+    }
+
+    ui::section("not sent");
+    for skipped in unportable.iter().take(NAMES_SHOWN) {
+        ui::field(
+            &skipped.path.display().to_string(),
+            &skipped.reason.to_string(),
+        );
+    }
+
+    if let Some(rest) = unportable.len().checked_sub(NAMES_SHOWN).filter(|n| *n > 0) {
+        ui::field("and", &format!("{rest} more"));
+    }
+
+    eprintln!();
+    eprintln!(
+        "warning: {} file(s) were not sent. Their names are usable here and cannot be",
+        unportable.len()
+    );
+    eprintln!("         written on Windows, so the receiver was never offered them.");
 }
 
 /// Turns `--limit-rate-mb` into a rate, refusing a limit of zero.

@@ -37,7 +37,7 @@ use crate::proto::messages::{Control, DataHeader, Decision, FileId};
 use crate::safety::limits::Limits;
 use crate::scan::hash_cache::{HASH_SIZE_CEILING_BYTES, HashCache, hash_file};
 use crate::scan::manifest::{Manifest, ManifestFile, batches};
-use crate::scan::walk::{WalkOptions, walk};
+use crate::scan::walk::{Unportable, WalkOptions, walk};
 use crate::transport::session::{Session, Streams};
 
 /// How the sender should behave.
@@ -96,7 +96,7 @@ impl Default for SendOptions {
 }
 
 /// What a send worked out and then did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Default)]
 pub struct SendReport {
     /// What actually crossed. Zero on a dry run.
     pub transferred: TransferSummary,
@@ -106,6 +106,9 @@ pub struct SendReport {
     pub planned: TransferSummary,
     /// Files the receiver already had.
     pub skipped: u64,
+    /// Files that were never offered because their names cannot cross, each with the
+    /// reason. Empty on almost every tree; not empty is something the user has to see.
+    pub unportable: Vec<Unportable>,
 }
 
 /// Sends a file or a whole directory tree, then closes the session.
@@ -124,7 +127,7 @@ pub async fn send_tree(
     limits: &Limits,
 ) -> Result<SendReport, PipelineError> {
     let scanning = std::time::Instant::now();
-    let manifest = build_manifest(root, &options, limits).await?;
+    let (manifest, unportable) = build_manifest(root, &options, limits).await?;
     let scanned_in = scanning.elapsed();
 
     options
@@ -188,6 +191,7 @@ pub async fn send_tree(
         transferred,
         planned,
         skipped,
+        unportable,
     })
 }
 
@@ -487,7 +491,7 @@ async fn build_manifest(
     root: &Path,
     options: &SendOptions,
     limits: &Limits,
-) -> Result<Manifest, PipelineError> {
+) -> Result<(Manifest, Vec<Unportable>), PipelineError> {
     let root = root.to_path_buf();
     let walk_options = WalkOptions {
         follow_links: options.follow_links,
@@ -497,9 +501,9 @@ async fn build_manifest(
 
     // Walking and hashing are both blocking disk work; keeping them off the async runtime
     // is the difference between a busy transfer and a stalled one.
-    let manifest = tokio::task::spawn_blocking(move || {
+    let scanned = tokio::task::spawn_blocking(move || {
         let scanned = walk(&root, walk_options, &limits)?;
-        let mut manifest = Manifest::from_scan(scanned);
+        let mut manifest = Manifest::from_scan(scanned.files);
 
         // The cache lives beside the data it describes, so moving a folder takes its
         // hashes along.
@@ -538,12 +542,12 @@ async fn build_manifest(
         }
 
         cache.save();
-        Ok::<Manifest, crate::scan::manifest::ScanError>(manifest)
+        Ok::<_, crate::scan::manifest::ScanError>((manifest, scanned.unportable))
     })
     .await
     .map_err(joined_error)??;
 
-    Ok(manifest)
+    Ok(scanned)
 }
 
 /// Whether this file's hash is worth computing before it is offered.

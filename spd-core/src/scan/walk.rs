@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::safety::limits::Limits;
-use crate::safety::path::SafeRelPath;
+use crate::safety::path::{PathError, SafeRelPath};
 use crate::scan::manifest::ScanError;
 
 /// One file found under the transfer root.
@@ -34,6 +34,31 @@ pub struct WalkOptions {
     pub follow_links: bool,
 }
 
+/// A file whose name cannot cross to the other side.
+///
+/// Almost always a name that is ordinary here and impossible on Windows: `?`, `*`, `:`, a
+/// trailing dot, or one of the reserved device names. The file is real and readable; there
+/// is simply nothing the receiver could call it.
+#[derive(Debug)]
+pub struct Unportable {
+    /// Where it is on this machine.
+    pub path: PathBuf,
+    /// Which rule its name broke.
+    pub reason: PathError,
+}
+
+/// What a walk found, and what it had to leave behind.
+#[derive(Debug, Default)]
+pub struct Scanned {
+    /// Files that can be offered, largest first.
+    pub files: Vec<ScannedFile>,
+    /// Files that cannot, each with the reason.
+    ///
+    /// Kept rather than counted: "3 files were skipped" is not something a user can act on,
+    /// and the whole point of reporting it is that they can go and look.
+    pub unportable: Vec<Unportable>,
+}
+
 /// Lists every file under `root`, largest first.
 ///
 /// Largest first because the work queue hands batches to workers: starting with the big
@@ -42,32 +67,34 @@ pub struct WalkOptions {
 ///
 /// A single file as `root` is a tree of one, so callers do not need a separate path for it.
 ///
-/// A file that disappears between being listed and being measured is skipped. Trees are
-/// live: editors write and rename, servers churn through temporary files, and a scan that
-/// refuses to send ten thousand files because one of them stopped existing is refusing the
-/// one job it had.
+/// Two things are left behind rather than reported as failures, because a real tree
+/// contains both and refusing the whole transfer over either is refusing the one job this
+/// has. A file that disappears between being listed and being measured: trees are live,
+/// editors write and rename, servers churn through temporary files. And a file whose name
+/// cannot cross - `?` and `*` are ordinary on Linux and impossible on Windows - which is
+/// returned in [`Scanned::unportable`] so the caller can say which files those were.
 ///
 /// # Errors
 /// [`ScanError::Unreadable`] if the root cannot be read, or if a file under it cannot be
 /// read for any reason other than no longer being there - a permission denied is a file the
-/// user asked to send and will not get. [`ScanError::Path`] if a name under it cannot cross
-/// safely: a file the receiver could not name is a failure to report, not something to skip
-/// silently.
-pub fn walk(
-    root: &Path,
-    options: WalkOptions,
-    limits: &Limits,
-) -> Result<Vec<ScannedFile>, ScanError> {
+/// user asked to send and will not get.
+pub fn walk(root: &Path, options: WalkOptions, limits: &Limits) -> Result<Scanned, ScanError> {
     let metadata = std::fs::metadata(root).map_err(|source| ScanError::Unreadable {
         path: root.to_path_buf(),
         source,
     })?;
 
+    // A single file named on the command line is different: the user pointed at that file
+    // and nothing else, so a name that cannot cross is a refusal rather than a skip.
     if metadata.is_file() {
-        return Ok(vec![describe(root, root, &metadata, limits)?]);
+        return Ok(Scanned {
+            files: vec![describe(root, root, &metadata, limits)?],
+            unportable: Vec::new(),
+        });
     }
 
     let mut found = Vec::new();
+    let mut unportable = Vec::new();
 
     for entry in jwalk::WalkDir::new(root)
         .follow_links(options.follow_links)
@@ -122,7 +149,17 @@ pub fn walk(
             }
         };
 
-        found.push(describe(&path, root, &metadata, limits)?);
+        match describe(&path, root, &metadata, limits) {
+            Ok(file) => found.push(file),
+            // The file is here and readable; it is its *name* that has nowhere to go. That
+            // is worth telling the user about, and worth telling them at the end rather
+            // than by refusing everything else.
+            Err(ScanError::Path(reason)) => {
+                tracing::warn!(path = %path.display(), %reason, "cannot send this name");
+                unportable.push(Unportable { path, reason });
+            }
+            Err(other) => return Err(other),
+        }
     }
 
     found.sort_by(|left, right| {
@@ -132,7 +169,10 @@ pub fn walk(
             .then_with(|| left.relative.cmp(&right.relative))
     });
 
-    Ok(found)
+    Ok(Scanned {
+        files: found,
+        unportable,
+    })
 }
 
 /// Whether an error means the thing is simply not there any more.
@@ -224,10 +264,10 @@ mod tests {
 
         let found = walk(&root, WalkOptions::default(), &Limits::DEFAULT).unwrap();
 
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].relative.to_string(), "nested/big.bin");
-        assert_eq!(found[0].size, 4096);
-        assert_eq!(found[1].relative.to_string(), "small.txt");
+        assert_eq!(found.files.len(), 2);
+        assert_eq!(found.files[0].relative.to_string(), "nested/big.bin");
+        assert_eq!(found.files[0].size, 4096);
+        assert_eq!(found.files[1].relative.to_string(), "small.txt");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -240,8 +280,38 @@ mod tests {
 
         let found = walk(&file, WalkOptions::default(), &Limits::DEFAULT).unwrap();
 
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].relative.to_string(), "only.bin");
+        assert_eq!(found.files.len(), 1);
+        assert_eq!(found.files[0].relative.to_string(), "only.bin");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A name that is ordinary on this platform and impossible on the other is reported,
+    /// not fatal. Refusing a whole tree because one plugin wrote a file called `?` is the
+    /// difference between a backup that runs and a backup that does not.
+    ///
+    /// Unix only: Windows cannot create these names in the first place, which is the whole
+    /// reason they cannot cross.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_cannot_cross_is_reported_and_the_rest_still_goes() {
+        let root = scratch("unportable");
+        std::fs::write(root.join("ordinary.txt"), b"fine").unwrap();
+        std::fs::write(root.join("?"), b"named after a wildcard").unwrap();
+        std::fs::write(root.join("what:now"), b"colon").unwrap();
+
+        let found = walk(&root, WalkOptions::default(), &Limits::DEFAULT).unwrap();
+
+        assert_eq!(found.files.len(), 1, "the ordinary file still goes");
+        assert_eq!(found.files[0].relative.to_string(), "ordinary.txt");
+        assert_eq!(found.unportable.len(), 2, "and the other two are named");
+        assert!(
+            found
+                .unportable
+                .iter()
+                .all(|skipped| skipped.path.starts_with(&root)),
+            "a skipped file is reported with the path the user can go and look at"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -15,6 +15,13 @@ Dates are the day the work was finished.
   missing file is tolerated; a permission denied or a failing disk is still reported,
   because each of those is a file the user asked to send and will not get.
 
+- **A name that cannot cross no longer fails the whole transfer.** `?`, `*`, `:`, a trailing
+  dot and the Windows device names are ordinary on Linux and impossible on Windows, and one
+  of them anywhere in a tree aborted everything. Those files are now left out and listed at
+  the end, under `not sent`, with the path and the rule each one broke - so the transfer
+  finishes and the user can still see exactly what did not go. A single file named on the
+  command line is still a refusal: there the user pointed at that one file and nothing else.
+
 ### Known, not yet fixed
 
 - **Throughput is capped by QUIC's default flow-control windows**, not by the link. quinn
