@@ -42,9 +42,9 @@ docs, error wording). Load them when writing or reviewing Rust.
 
 ## Phase status
 
-F0-F2 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport, and a
-verified single-file transfer (`spd send` / `spd recv`, `SafeRelPath`, `.part` plus atomic
-rename). F3 is the manifest and diff - see `PLAN.md §10`.
+F0-F3 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport,
+verified transfers (`SafeRelPath`, `.part` plus atomic rename) and folder sync with a hash
+cache, `--dry-run` and `--checksum`. F4 is parallelism - see `PLAN.md §10`.
 
 Nothing lands for a future phase ahead of time; each phase ends with green CI and a usable
 binary.

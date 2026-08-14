@@ -3,8 +3,8 @@
 Peer-to-peer file and folder transfer over QUIC. One connection, one stream per file,
 resume by byte offset, BLAKE3 verification end to end.
 
-**Status: early.** Phases F0-F2 are done: it moves one file, verified end to end. Folder
-sync, parallelism, resume and compression are still ahead. See [`PLAN.md`](PLAN.md).
+**Status: early.** Phases F0-F3 are done: it syncs a folder, verified end to end, sending
+only what changed. Parallelism, resume and compression are still ahead. See [`PLAN.md`](PLAN.md).
 
 ## Build
 
@@ -23,6 +23,7 @@ spd recv --out ./inbox --listen 0.0.0.0:9432 --insecure
 
 # sender
 spd send ./holiday.mp4 192.168.1.20:9432 --insecure
+spd send ./photos 192.168.1.20:9432 --insecure --dry-run   # what would move
 ```
 
 `--insecure` is required and not a default: it encrypts the traffic but does not prove who

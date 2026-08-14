@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F2 (single file) done. F3 (manifest and diff) next.
+**Status:** F3 (manifest and diff) done. F4 (parallelism) next.
 **Last updated:** 2026-08-14
 
 ---
@@ -429,10 +429,13 @@ Shipped: `SafeRelPath` (validated before anything touches the filesystem), `spd 
 `spd recv`, `.part` plus atomic rename, a graceful close so the final message is not
 discarded, and `--insecure` as a required, explicit choice.
 
-### F3 - Manifest and diff
+### F3 - Manifest and diff - **done**
 Parallel walk, hash cache, batched manifest, `Skip`/`Need`, `--dry-run`.
 **Done when:** a second run over an identical folder transfers 0 bytes; changing one file
 transfers only that file; `--dry-run` matches what the real run does.
+Shipped: parallel walk skipping `.spd`, persistent hash cache, batched manifest with a
+`Transfer` announcement so the receiver knows what is coming, `--dry-run`, `--checksum`,
+`--follow-links`, and mode bits applied where the platform has them.
 
 ### F4 - Parallelism
 Work queue, N streams, the four semaphores, bounded channels, buffer pool.

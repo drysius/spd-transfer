@@ -8,8 +8,8 @@ mod common;
 
 use common::{Scratch, bound_listener, dial, pattern};
 use spd_core::pipeline::PipelineError;
-use spd_core::pipeline::recv::receive_file;
-use spd_core::pipeline::send::send_file;
+use spd_core::pipeline::recv::{ReceiveOptions, receive_tree};
+use spd_core::pipeline::send::{SendOptions, send_tree};
 use spd_core::proto::codec::write_data_header;
 use spd_core::proto::messages::{Control, DataHeader, Decision, Entry, FileId};
 use spd_core::safety::limits::Limits;
@@ -27,18 +27,25 @@ async fn a_file_arrives_byte_identical() {
 
     let receiving = tokio::spawn(async move {
         let mut session = listener.accept().await.unwrap();
-        receive_file(&mut session, &destination_path, &limits)
-            .await
-            .unwrap()
+        receive_tree(
+            &mut session,
+            &destination_path,
+            ReceiveOptions::default(),
+            &limits,
+        )
+        .await
+        .unwrap()
     });
 
     let mut sender = dial(address, limits).await;
-    let sent = send_file(&mut sender, &file, &limits).await.unwrap();
+    let sent = send_tree(&mut sender, &file, SendOptions::default(), &limits)
+        .await
+        .unwrap();
     let received = receiving.await.unwrap();
 
-    assert_eq!(sent.files, 1);
-    assert_eq!(sent.bytes, contents.len() as u64);
-    assert_eq!(received.bytes, sent.bytes);
+    assert_eq!(sent.transferred.files, 1);
+    assert_eq!(sent.transferred.bytes, contents.len() as u64);
+    assert_eq!(received.bytes, sent.transferred.bytes);
 
     let arrived = std::fs::read(destination.path().join("payload.bin")).unwrap();
     assert_eq!(arrived, contents, "the file should arrive unchanged");
@@ -60,9 +67,14 @@ async fn corrupted_bytes_are_detected_and_nothing_is_committed() {
 
     let receiving = tokio::spawn(async move {
         let mut session = listener.accept().await.unwrap();
-        receive_file(&mut session, &destination_path, &limits)
-            .await
-            .unwrap_err()
+        receive_tree(
+            &mut session,
+            &destination_path,
+            ReceiveOptions::default(),
+            &limits,
+        )
+        .await
+        .unwrap_err()
     });
 
     let mut sender = dial(address, limits).await;
@@ -88,8 +100,15 @@ async fn corrupted_bytes_are_detected_and_nothing_is_committed() {
     let reply = sender.control().recv().await.unwrap();
     assert!(matches!(
         reply,
-        Control::SyncReply { ref decisions, .. } if matches!(decisions.first(), Some(Decision::Need { .. }))
+        Control::SyncReply { ref decisions, .. }
+            if matches!(decisions.first(), Some(Decision::Need { .. }))
     ));
+
+    sender
+        .control()
+        .send(&Control::Transfer { files: 1, bytes: 4 })
+        .await
+        .unwrap();
 
     let mut stream = sender.open_data_stream().await.unwrap();
     write_data_header(
@@ -142,9 +161,14 @@ async fn a_traversing_path_is_refused_before_anything_is_written() {
 
     let receiving = tokio::spawn(async move {
         let mut session = listener.accept().await.unwrap();
-        receive_file(&mut session, &destination_path, &limits)
-            .await
-            .unwrap_err()
+        receive_tree(
+            &mut session,
+            &destination_path,
+            ReceiveOptions::default(),
+            &limits,
+        )
+        .await
+        .unwrap_err()
     });
 
     let mut sender = dial(address, limits).await;

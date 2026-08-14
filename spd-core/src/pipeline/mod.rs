@@ -88,6 +88,10 @@ pub enum PipelineError {
     #[error(transparent)]
     Path(#[from] PathError),
 
+    /// The local tree could not be listed.
+    #[error(transparent)]
+    Scan(#[from] crate::scan::manifest::ScanError),
+
     /// Framing or serialisation failed.
     #[error(transparent)]
     Proto(#[from] ProtoError),

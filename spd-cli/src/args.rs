@@ -54,9 +54,13 @@ pub(crate) const DEFAULT_PORT: u16 = 9432;
 
 /// Options for `spd send`.
 #[derive(Debug, clap::Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "command-line switches are booleans; grouping them would only hide the surface"
+)]
 pub(crate) struct SendArgs {
-    /// File to send.
-    #[arg(value_name = "FILE")]
+    /// File or directory to send.
+    #[arg(value_name = "PATH")]
     pub(crate) file: PathBuf,
 
     /// Where the receiver is listening, as `host:port`.
@@ -67,6 +71,19 @@ pub(crate) struct SendArgs {
     /// proves the receiver is the machine you meant. Required until pairing exists.
     #[arg(long)]
     pub(crate) insecure: bool,
+
+    /// Negotiate as usual and report what would move, without sending any file.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+
+    /// Hash every file instead of trusting size and timestamp. Slower, and certain.
+    #[arg(long)]
+    pub(crate) checksum: bool,
+
+    /// Follow symlinks while scanning. Off by default: a link can point outside the tree
+    /// you meant to send.
+    #[arg(long)]
+    pub(crate) follow_links: bool,
 }
 
 /// Options for `spd recv`.
@@ -84,6 +101,10 @@ pub(crate) struct RecvArgs {
     /// proves the sender is who you expect. Required until pairing exists.
     #[arg(long)]
     pub(crate) insecure: bool,
+
+    /// Hash local files before deciding, instead of trusting size and timestamp.
+    #[arg(long)]
+    pub(crate) checksum: bool,
 }
 
 fn default_listen_address() -> SocketAddr {

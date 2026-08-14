@@ -126,6 +126,18 @@ pub enum Control {
         decisions: Vec<Decision>,
     },
 
+    /// Sender: the decisions are in, and this is what is actually coming.
+    ///
+    /// Without it the receiver cannot tell "nothing to send" from "the streams have not
+    /// arrived yet", and a dry run would leave it waiting for files that were never
+    /// requested.
+    Transfer {
+        /// Files about to be streamed.
+        files: u64,
+        /// Bytes those files hold.
+        bytes: u64,
+    },
+
     /// Sender: this file is fully written to its stream, and this is its hash.
     FileDone {
         /// Which file.
@@ -168,6 +180,7 @@ impl Control {
             Self::HelloAck { .. } => "HelloAck",
             Self::Manifest { .. } => "Manifest",
             Self::SyncReply { .. } => "SyncReply",
+            Self::Transfer { .. } => "Transfer",
             Self::FileDone { .. } => "FileDone",
             Self::FileVerdict { .. } => "FileVerdict",
             Self::Done { .. } => "Done",

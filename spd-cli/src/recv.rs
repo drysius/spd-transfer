@@ -1,7 +1,7 @@
 //! `spd recv` - wait for one peer and write what it sends.
 
 use anyhow::{Context, Result};
-use spd_core::pipeline::recv::receive_file;
+use spd_core::pipeline::recv::{ReceiveOptions, receive_tree};
 use spd_core::proto::messages::DeviceId;
 use spd_core::safety::limits::Limits;
 use spd_core::transport::listen;
@@ -44,7 +44,11 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
     ui::field("peer", &session.peer().device.to_string());
     ui::field("address", &session.peer().address.to_string());
 
-    let summary = receive_file(&mut session, &destination, &limits)
+    let options = ReceiveOptions {
+        checksum: args.checksum,
+    };
+
+    let summary = receive_tree(&mut session, &destination, options, &limits)
         .await
         .context("the transfer failed")?;
 
