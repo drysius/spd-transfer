@@ -8,8 +8,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use spd_core::pipeline::budget::{self, DEFAULT_BUF_SIZE_BYTES, DEFAULT_PIPELINE_DEPTH};
+use spd_core::proto::version::{Features, PROTOCOL_VERSION};
 use spd_core::safety::limits::Limits;
-use spd_core::version::{Features, PROTOCOL_VERSION};
 
 use crate::args::DoctorArgs;
 use crate::ui;

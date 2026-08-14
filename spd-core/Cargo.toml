@@ -10,8 +10,21 @@ repository.workspace = true
 # Dependency rule (checked by CI): no UI crates here.
 # Forbidden: clap, indicatif, anyhow.
 [dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+postcard.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true

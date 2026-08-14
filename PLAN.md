@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F0 (skeleton) done. F1 (transport) next.
+**Status:** F1 (transport) done. F2 (single file) next.
 **Last updated:** 2026-08-14
 
 ---
@@ -411,11 +411,14 @@ Linux/Windows/macOS matrix.
 Shipped: `Limits` + validation, version/feature negotiation, memory-budget arithmetic,
 `spd doctor`.
 
-### F1 - Transport
+### F1 - Transport - **done**
 `quinn` + `rustls` + `rcgen`. Client/server endpoint, `Hello`/`HelloAck` handshake, control
 stream codec, version and feature negotiation.
 **Done when:** an integration test connects over loopback, negotiates and exchanges control
 messages; an incompatible version is rejected with a typed error.
+Shipped: ALPN `spd/1`, TLS 1.3 with `TrustPolicy`, typed `ControlChannel`, data-stream
+headers bounded before allocation, handshake timeouts, and a refusal that reaches the peer
+carrying its reason.
 
 ### F2 - One file
 Sending and receiving a single file. No compression, no parallelism. `.part` -> BLAKE3 ->

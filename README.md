@@ -3,8 +3,9 @@
 Peer-to-peer file and folder transfer over QUIC. One connection, one stream per file,
 resume by byte offset, BLAKE3 verification end to end.
 
-**Status: early.** Phase F0 (skeleton) is done - limits, version negotiation, memory-budget
-model, CI. The transfer itself lands in F1-F2. See [`PLAN.md`](PLAN.md).
+**Status: early.** Phases F0-F1 are done - limits, version negotiation, memory-budget model,
+CI, and the QUIC transport with its handshake. Moving files lands in F2. See
+[`PLAN.md`](PLAN.md).
 
 ## Build
 

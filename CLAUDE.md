@@ -42,8 +42,9 @@ docs, error wording). Load them when writing or reviewing Rust.
 
 ## Phase status
 
-F0 skeleton is done: `Limits` + validation, version/feature negotiation, memory-budget
-arithmetic, `spd doctor`, CI, `xtask`. F1 is the QUIC transport - see `PLAN.md §10`.
+F0-F1 are done: limits, version/feature negotiation, memory budget, `spd doctor`, CI,
+`xtask`, and the QUIC transport (endpoints, TLS policy, handshake, control stream). F2 is
+the single-file transfer - see `PLAN.md §10`.
 
 Nothing lands for a future phase ahead of time; each phase ends with green CI and a usable
 binary.

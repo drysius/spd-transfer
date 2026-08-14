@@ -1,15 +1,14 @@
 //! Core of `spd-transfer`: peer-to-peer file and folder transfer over QUIC.
 //!
-//! This crate holds all protocol logic and carries no user-interface dependency —
+//! This crate holds all protocol logic and carries no user-interface dependency -
 //! no `clap`, no `indicatif`, no `anyhow`. Errors are typed with `thiserror` so the
 //! caller can branch on them; wording for humans happens in `spd-cli`.
 //!
 //! # Phase status
 //!
 //! The project is built in phases (see `PLAN.md §10`); every phase ends with green CI
-//! and a usable binary. Currently at **F0 — skeleton**: errors, version negotiation,
-//! safety limits and the memory-budget model. Transport, protocol and pipeline land in
-//! F1 onwards.
+//! and a usable binary. Currently at **F1 - transport**: QUIC endpoints, the TLS policy,
+//! the handshake and the typed control stream. The transfer pipeline lands in F2.
 
 // Panicking is a bug in the core: a failure that reaches the user must be a typed error,
 // never an abort. Tests are exempt so assertions stay readable.
@@ -20,7 +19,8 @@
 
 pub mod error;
 pub mod pipeline;
+pub mod proto;
 pub mod safety;
-pub mod version;
+pub mod transport;
 
 pub use error::{Error, Result};
