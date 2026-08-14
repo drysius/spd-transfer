@@ -1,8 +1,10 @@
 //! `spd recv` - wait for one peer and write what it sends.
 
-use std::num::NonZeroU32;
+use core::num::NonZeroU32;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
+use spd_core::metrics::Progress;
 use spd_core::pipeline::budget::JobLimits;
 use spd_core::pipeline::recv::ReceiveOptions;
 use spd_core::pipeline::retry::{RetryPolicy, receive_tree_resuming};
@@ -11,7 +13,8 @@ use spd_core::safety::limits::Limits;
 use spd_core::transport::listen;
 
 use crate::args::RecvArgs;
-use crate::{auth, ui};
+use crate::progress::Bar;
+use crate::{auth, stats, ui};
 
 /// Listens, accepts one peer, receives what it offers.
 ///
@@ -34,6 +37,7 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
         ..Limits::DEFAULT
     };
 
+    let progress = Progress::new();
     let options = ReceiveOptions {
         checksum: args.checksum,
         mem_budget_bytes: args.mem_budget_mb.saturating_mul(1024 * 1024),
@@ -43,6 +47,7 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
             cpu_jobs,
             ..JobLimits::DEFAULT
         },
+        progress: progress.clone(),
     };
 
     let destination = args
@@ -63,15 +68,25 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
         ..RetryPolicy::DEFAULT
     };
 
-    let summary = receive_tree_resuming(&listener, &destination, options, &limits, retry)
-        .await
-        .context("the transfer failed")?;
+    // Started before the wait for a peer, so the bar is already there when bytes are.
+    let bar = Bar::start(&progress, !args.no_progress);
+    let started = Instant::now();
+
+    let summary = receive_tree_resuming(&listener, &destination, options, &limits, retry).await;
+
+    bar.stop();
+    let elapsed = started.elapsed();
+    let summary = summary.context("the transfer failed")?;
 
     ui::section("received");
     ui::field("files", &summary.files.to_string());
     ui::field("bytes", &ui::format_bytes(summary.bytes));
     if summary.wire_bytes != summary.bytes {
         ui::field("on the wire", &ui::format_bytes(summary.wire_bytes));
+    }
+
+    if args.stats {
+        stats::print(&progress.snapshot(), elapsed);
     }
 
     Ok(())

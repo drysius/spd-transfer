@@ -1,22 +1,26 @@
 //! `spd send` - offer a file or a folder to a waiting peer.
 
-use std::num::NonZeroU32;
+use core::num::{NonZeroU32, NonZeroU64};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
+use spd_core::metrics::Progress;
 use spd_core::pipeline::budget::JobLimits;
+use spd_core::pipeline::rate::RateLimit;
 use spd_core::pipeline::retry::{RetryPolicy, send_tree_reconnecting};
 use spd_core::pipeline::send::SendOptions;
 use spd_core::proto::messages::DeviceId;
 use spd_core::safety::limits::Limits;
 
 use crate::args::SendArgs;
-use crate::{auth, ui};
+use crate::progress::Bar;
+use crate::{auth, stats, ui};
 
 /// Connects, offers the tree, sends whatever the receiver asks for.
 ///
 /// # Errors
-/// Fails if the peer is unreachable, the tree cannot be read, or the receiver reports that
-/// a hash did not match.
+/// Fails if the peer is unreachable, the tree cannot be read, the pairing code does not
+/// match, or the receiver reports that a hash did not match.
 pub(crate) async fn run(args: &SendArgs) -> Result<()> {
     let authentication = auth::for_sender(args.code.as_deref(), args.insecure)?;
     let device = DeviceId::random()?;
@@ -31,6 +35,7 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
         ..Limits::DEFAULT
     };
 
+    let progress = Progress::new();
     let options = SendOptions {
         follow_links: args.follow_links,
         checksum: args.checksum,
@@ -43,6 +48,8 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
             cpu_jobs,
             ..JobLimits::DEFAULT
         },
+        rate: rate_limit(args.limit_rate_mb)?,
+        progress: progress.clone(),
     };
 
     let retry = RetryPolicy {
@@ -55,6 +62,10 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
     ui::field("device", &device.to_string());
     ui::field("path", &args.file.display().to_string());
 
+    // A dry run negotiates and stops; a bar for it would flash once and vanish.
+    let bar = Bar::start(&progress, !args.no_progress && !args.dry_run);
+    let started = Instant::now();
+
     let report = send_tree_reconnecting(
         args.address,
         device,
@@ -64,8 +75,11 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
         &limits,
         retry,
     )
-    .await
-    .with_context(|| format!("could not send {}", args.file.display()))?;
+    .await;
+
+    bar.stop();
+    let elapsed = started.elapsed();
+    let report = report.with_context(|| format!("could not send {}", args.file.display()))?;
 
     if args.dry_run {
         ui::section("dry run");
@@ -86,5 +100,24 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
     }
     ui::field("skipped", &report.skipped.to_string());
 
+    if args.stats {
+        stats::print(&progress.snapshot(), elapsed);
+    }
+
     Ok(())
+}
+
+/// Turns `--limit-rate-mb` into a rate, refusing a limit of zero.
+///
+/// Zero would mean "never send anything", which nobody means and which would look like a
+/// hang rather than a mistake.
+fn rate_limit(mib_per_second: Option<u64>) -> Result<RateLimit> {
+    let Some(mib) = mib_per_second else {
+        return Ok(RateLimit::UNLIMITED);
+    };
+
+    let bytes = NonZeroU64::new(mib.saturating_mul(1024 * 1024))
+        .context("--limit-rate-mb must be at least 1")?;
+
+    Ok(RateLimit::bytes_per_second(bytes))
 }

@@ -48,9 +48,10 @@ F0-F7 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transp
 verified transfers (`SafeRelPath`, `.part` plus atomic rename), folder sync with a hash
 cache, parallel transfers (work queue, buffer pool, `--streams`, `--mem-budget-mb`),
 resume (state actor over a journal in `.spd`, offset resume, reconnection with backoff,
-`--attempts`), zstd compression decided per file (`--no-compress`, `--cpu-jobs`) and
-pairing (`--code`, proof bound to the TLS session; `--insecure` still exists and still
-warns). F8 is finishing - see `PLAN.md §10`.
+`--attempts`), zstd compression decided per file (`--no-compress`, `--cpu-jobs`), pairing
+(`--code`, proof bound to the TLS session; `--insecure` still exists and still warns) and
+the finishing pass (progress bar, `--stats`, `--limit-rate-mb`). F9 is hardening - see
+`PLAN.md §10`.
 
 Nothing lands for a future phase ahead of time; each phase ends with green CI and a usable
 binary.

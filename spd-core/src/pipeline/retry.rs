@@ -103,7 +103,7 @@ pub async fn send_tree_reconnecting(
 
     loop {
         let outcome = match connect(address, device, auth, *limits).await {
-            Ok(session) => send_tree(session, root, options, limits).await,
+            Ok(session) => send_tree(session, root, options.clone(), limits).await,
             Err(unreachable) => Err(PipelineError::Transport(unreachable)),
         };
 
@@ -135,7 +135,7 @@ pub async fn receive_tree_resuming(
 
     loop {
         let outcome = match listener.accept().await {
-            Ok(session) => receive_tree(session, destination, options, limits).await,
+            Ok(session) => receive_tree(session, destination, options.clone(), limits).await,
             Err(refused) => Err(PipelineError::Transport(refused)),
         };
 

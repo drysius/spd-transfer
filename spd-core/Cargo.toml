@@ -28,7 +28,10 @@ tracing.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# `test-util` lets a test move time forward instead of sleeping through it: the rate
+# limiter's behaviour is measured in seconds, and a suite that waits them out is a suite
+# nobody runs.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [lints]
 workspace = true

@@ -9,6 +9,7 @@ pub mod bufpool;
 pub mod control;
 mod cpu;
 mod prefix;
+pub mod rate;
 pub mod recv;
 pub mod retry;
 pub mod send;

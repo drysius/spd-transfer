@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F7 (security) done. F8 (finishing) next.
+**Status:** F8 (finishing) done. F9 (hardening) next.
 **Last updated:** 2026-08-14
 
 ---
@@ -524,9 +524,23 @@ not four digits. And the 1 h fuzz run is a command a human runs (`cargo xtask fu
 something CI does - what CI runs is a deterministic sweep of the same harnesses, which
 catches a harness that stopped compiling or started panicking.
 
-### F8 - Finishing
+### F8 - Finishing - **done**
 Progress bars, `--stats`, bandwidth limit (token bucket), LAN discovery (optional), readable
 error messages, complete `--help`.
+Shipped: `metrics.rs` - atomic counters behind a cheap handle, read by whoever is drawing
+and never waited on by anyone moving bytes; one global progress bar on both sides, hidden
+automatically when output is not a terminal, and `--no-progress` when it is; `--stats` with
+bytes, compression saving, scan time, total time and throughput; and a token-bucket rate
+limiter as an actor, exposed as `--limit-rate-mb`.
+Measured: 19 MiB with `--limit-rate-mb 10` took 1.8 s at a reported 10.3 MiB/s. The bucket
+opens with one buffer rather than one second of rate - starting full let any transfer
+shorter than a second ignore the limit completely, which is exactly the transfer someone
+sharing a link cares about.
+Two departures. LAN discovery is not here; the plan marked it optional and it is the one
+item that adds a listening surface rather than removing a rough edge. And `--verbose` does
+not draw one bar per stream: per-file detail is already an `--log-level debug` line
+carrying the path, the bytes and where it resumed from, and a second mechanism for the same
+information would be a second thing to keep true.
 
 ### F9 - Hardening
 Property tests, `criterion` benchmarks, cross-version interop test (golden wire-format

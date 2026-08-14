@@ -7,8 +7,10 @@
 mod args;
 mod auth;
 mod doctor;
+mod progress;
 mod recv;
 mod send;
+mod stats;
 mod ui;
 
 use anyhow::{Context, Result};

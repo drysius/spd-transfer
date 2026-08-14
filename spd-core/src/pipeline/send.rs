@@ -24,11 +24,13 @@ use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use crate::compress::{self, CompressError, Encoder};
+use crate::metrics::Progress;
 use crate::pipeline::budget::{DEFAULT_MEM_BUDGET_BYTES, JobLimits, TransferPlan};
 use crate::pipeline::bufpool::{BufferPool, PooledBuffer};
 use crate::pipeline::control::{Outbox, spawn_outbox};
 use crate::pipeline::cpu::on_cpu;
 use crate::pipeline::prefix::hash_prefix;
+use crate::pipeline::rate::{Meter, RateLimit};
 use crate::pipeline::{PipelineError, TransferSummary};
 use crate::proto::codec::{ControlReader, ControlWriter, write_data_header};
 use crate::proto::messages::{Control, DataHeader, Decision, FileId};
@@ -39,7 +41,11 @@ use crate::scan::walk::{WalkOptions, walk};
 use crate::transport::session::{Session, Streams};
 
 /// How the sender should behave.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Cloned rather than copied: it carries the progress handle, which is an `Arc` because the
+/// caller drawing a progress bar and the workers moving bytes have to look at the same
+/// counters.
+#[derive(Debug, Clone)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "these are the command-line switches; grouping them into enums would only put \
@@ -66,6 +72,12 @@ pub struct SendOptions {
 
     /// Explicit ceilings on concurrent work.
     pub jobs: JobLimits,
+
+    /// How fast bytes may go on the wire.
+    pub rate: RateLimit,
+
+    /// Counters for whoever is drawing progress. Ignoring them costs nothing.
+    pub progress: Progress,
 }
 
 impl Default for SendOptions {
@@ -77,6 +89,8 @@ impl Default for SendOptions {
             compress: true,
             mem_budget_bytes: DEFAULT_MEM_BUDGET_BYTES,
             jobs: JobLimits::DEFAULT,
+            rate: RateLimit::UNLIMITED,
+            progress: Progress::new(),
         }
     }
 }
@@ -109,10 +123,17 @@ pub async fn send_tree(
     options: SendOptions,
     limits: &Limits,
 ) -> Result<SendReport, PipelineError> {
-    let manifest = build_manifest(root, options, limits).await?;
+    let scanning = std::time::Instant::now();
+    let manifest = build_manifest(root, &options, limits).await?;
+    let scanned_in = scanning.elapsed();
+
+    options
+        .progress
+        .scanned_in(u64::try_from(scanned_in.as_millis()).unwrap_or(u64::MAX));
     tracing::info!(
         files = manifest.len(),
         bytes = manifest.total_bytes(),
+        millis = scanned_in.as_millis(),
         "offering"
     );
 
@@ -130,6 +151,7 @@ pub async fn send_tree(
         wire_bytes: 0,
     };
     let skipped = manifest.len() as u64 - planned.files;
+    options.progress.expect(planned.files, planned.bytes);
 
     let transferred = if options.dry_run {
         // Announce nothing, so the receiver stops waiting instead of holding a connection
@@ -154,7 +176,7 @@ pub async fn send_tree(
             })
             .await?;
 
-        run_workers(&parts.streams, parts.writer, parts.reader, needed, options).await?
+        run_workers(&parts.streams, parts.writer, parts.reader, needed, &options).await?
     };
 
     parts
@@ -187,7 +209,7 @@ async fn run_workers(
     writer: ControlWriter,
     reader: ControlReader,
     needed: Vec<Needed>,
-    options: SendOptions,
+    options: &SendOptions,
 ) -> Result<TransferSummary, PipelineError> {
     let plan = TransferPlan::derive(options.mem_budget_bytes, options.jobs);
     tracing::info!(
@@ -213,6 +235,7 @@ async fn run_workers(
     let disk_read = Arc::new(Semaphore::new(plan.disk_read_jobs.get() as usize));
     let cpu_jobs = Arc::new(Semaphore::new(plan.cpu_jobs.get() as usize));
     let queue = Arc::new(Mutex::new(queue));
+    let (meter, meter_task) = Meter::spawn(options.rate);
 
     let mut workers = JoinSet::new();
     for _ in 0..plan.workers.get() {
@@ -223,9 +246,14 @@ async fn run_workers(
             pool.clone(),
             Arc::clone(&disk_read),
             Arc::clone(&cpu_jobs),
-            options,
+            meter.clone(),
+            options.clone(),
         ));
     }
+
+    // The meter is only alive while workers hold a clone of it; this one exists to hand out
+    // and would otherwise keep the bucket's task running after the last file.
+    drop(meter);
 
     let mut transferred = TransferSummary::default();
     let mut failure = None;
@@ -265,6 +293,10 @@ async fn run_workers(
     drop(outbox);
     join_control(writer_task, reader_task).await?;
 
+    if let Some(task) = meter_task {
+        task.await.map_err(joined_error)?;
+    }
+
     Ok(transferred)
 }
 
@@ -272,6 +304,11 @@ async fn run_workers(
 type WorkQueue = Arc<Mutex<VecDeque<(Needed, oneshot::Receiver<bool>)>>>;
 
 /// Pulls files from the shared queue until it is empty.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each one is a distinct collaborator with a single owner; bundling them would \
+              only hide who holds what"
+)]
 async fn worker(
     streams: Streams,
     outbox: Outbox,
@@ -279,6 +316,7 @@ async fn worker(
     pool: BufferPool,
     disk_read: Arc<Semaphore>,
     cpu_jobs: Arc<Semaphore>,
+    meter: Meter,
     options: SendOptions,
 ) -> Result<TransferSummary, PipelineError> {
     let mut summary = TransferSummary::default();
@@ -292,8 +330,11 @@ async fn worker(
             // The permit is held only while the file is being read, so a worker waiting
             // for a verdict is not also holding a disk slot.
             let _permit = disk_read.acquire().await;
-            let compressed = worth_compressing(&need, &pool, &cpu_jobs, options).await?;
-            stream_body(&streams, &need, &pool, &cpu_jobs, compressed).await?
+            let compressed = worth_compressing(&need, &pool, &cpu_jobs, &options).await?;
+            stream_body(
+                &streams, &need, &pool, &cpu_jobs, &meter, compressed, &options,
+            )
+            .await?
         };
 
         outbox
@@ -313,6 +354,7 @@ async fn worker(
         summary.files += 1;
         summary.bytes = summary.bytes.saturating_add(need.remaining);
         summary.wire_bytes = summary.wire_bytes.saturating_add(sent.wire_bytes);
+        options.progress.finished_file();
     }
 }
 
@@ -328,7 +370,7 @@ async fn worth_compressing(
     need: &Needed,
     pool: &BufferPool,
     cpu_jobs: &Arc<Semaphore>,
-    options: SendOptions,
+    options: &SendOptions,
 ) -> Result<bool, PipelineError> {
     if !options.compress || compress::is_already_compressed(&need.source) {
         return Ok(false);
@@ -428,7 +470,7 @@ fn joined_error(joined: tokio::task::JoinError) -> PipelineError {
 /// Scans the tree and fills in the hashes that are cheap to know.
 async fn build_manifest(
     root: &Path,
-    options: SendOptions,
+    options: &SendOptions,
     limits: &Limits,
 ) -> Result<Manifest, PipelineError> {
     let root = root.to_path_buf();
@@ -436,6 +478,7 @@ async fn build_manifest(
         follow_links: options.follow_links,
     };
     let limits = *limits;
+    let checksum = options.checksum;
 
     // Walking and hashing are both blocking disk work; keeping them off the async runtime
     // is the difference between a busy transfer and a stalled one.
@@ -453,7 +496,7 @@ async fn build_manifest(
         let mut cache = HashCache::open(&cache_root);
 
         for file in manifest.files_mut() {
-            if !should_hash(file, options) {
+            if !should_hash(file, checksum) {
                 continue;
             }
 
@@ -488,8 +531,13 @@ async fn build_manifest(
     Ok(manifest)
 }
 
-fn should_hash(file: &ManifestFile, options: SendOptions) -> bool {
-    options.checksum || file.scanned.size <= HASH_SIZE_CEILING_BYTES
+/// Whether this file's hash is worth computing before it is offered.
+///
+/// Takes the flag rather than the options because it runs inside the blocking scan, where
+/// borrowing the caller's options would mean keeping them alive across a thread boundary
+/// for one boolean.
+fn should_hash(file: &ManifestFile, checksum: bool) -> bool {
+    checksum || file.scanned.size <= HASH_SIZE_CEILING_BYTES
 }
 
 /// Offers the manifest in batches and collects what the receiver wants.
@@ -616,7 +664,9 @@ async fn stream_body(
     need: &Needed,
     pool: &BufferPool,
     cpu_jobs: &Arc<Semaphore>,
+    meter: &Meter,
     compressed: bool,
+    options: &SendOptions,
 ) -> Result<Sent, PipelineError> {
     let source = need.source.as_path();
     let mut file = File::open(source)
@@ -680,6 +730,7 @@ async fn stream_body(
         }
 
         stage.filled(read);
+        let mut chunk_wire = 0_u64;
 
         // One pass is enough for a body crossing as it is; a compressed one goes round
         // until the codec has taken the whole chunk, because its output can need more room
@@ -696,8 +747,11 @@ async fn stream_body(
             stage = returned;
             stepped?;
 
-            wire_bytes += send(&mut stream, stage.ready(), source).await?;
+            chunk_wire += send(&mut stream, stage.ready(), source, meter).await?;
         }
+
+        wire_bytes += chunk_wire;
+        options.progress.advance(read as u64, chunk_wire);
     }
 
     while stage.unfinished() {
@@ -712,7 +766,9 @@ async fn stream_body(
         stage = returned;
         tail?;
 
-        wire_bytes += send(&mut stream, stage.ready(), source).await?;
+        let produced = send(&mut stream, stage.ready(), source, meter).await?;
+        wire_bytes += produced;
+        options.progress.advance(0, produced);
     }
 
     // Finishing the stream is how the receiver learns the file ended; without it, it waits
@@ -730,14 +786,20 @@ async fn stream_body(
 }
 
 /// Writes one block to the stream and says how many bytes that was.
+///
+/// Waits for the rate limiter first, so a bandwidth limit paces the bytes as they go out
+/// rather than sending a burst and sleeping afterwards.
 async fn send(
     stream: &mut quinn::SendStream,
     block: &[u8],
     source: &Path,
+    meter: &Meter,
 ) -> Result<u64, PipelineError> {
     if block.is_empty() {
         return Ok(0);
     }
+
+    meter.take(block.len() as u64).await?;
 
     stream
         .write_all(block)

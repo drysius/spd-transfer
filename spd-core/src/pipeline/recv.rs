@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use crate::compress::{CompressError, Decoder};
+use crate::metrics::Progress;
 use crate::pipeline::budget::{DEFAULT_MEM_BUDGET_BYTES, JobLimits, TransferPlan};
 use crate::pipeline::bufpool::{BufferPool, PooledBuffer};
 use crate::pipeline::control::{Outbox, spawn_outbox};
@@ -45,7 +46,10 @@ use crate::transport::session::{Session, Streams};
 const PARTIAL_SUFFIX: &str = ".part";
 
 /// How the receiver should behave.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Cloned rather than copied, for the same reason as [`crate::pipeline::send::SendOptions`]:
+/// it carries the progress handle.
+#[derive(Debug, Clone)]
 pub struct ReceiveOptions {
     /// Hash local files even when the sender offered no hash, so a matching timestamp is
     /// never taken as proof on its own.
@@ -56,6 +60,9 @@ pub struct ReceiveOptions {
 
     /// Explicit ceilings on concurrent work.
     pub jobs: JobLimits,
+
+    /// Counters for whoever is drawing progress. Ignoring them costs nothing.
+    pub progress: Progress,
 }
 
 impl Default for ReceiveOptions {
@@ -64,6 +71,7 @@ impl Default for ReceiveOptions {
             checksum: false,
             mem_budget_bytes: DEFAULT_MEM_BUDGET_BYTES,
             jobs: JobLimits::DEFAULT,
+            progress: Progress::new(),
         }
     }
 }
@@ -91,13 +99,18 @@ pub async fn receive_tree(
         &mut parts.reader,
         destination,
         &state,
-        options,
+        &options,
         limits,
     )
     .await?;
 
     let coming = match parts.reader.recv().await? {
-        Control::Transfer { files, .. } => files,
+        Control::Transfer { files, bytes } => {
+            // The sender's announcement is the only total this side can know before the
+            // bytes turn up, and it is what a progress bar needs to draw anything.
+            options.progress.expect(files, bytes);
+            files
+        }
         Control::Error { msg, .. } => return Err(PipelineError::PeerFailed { msg }),
         other => {
             return Err(PipelineError::UnexpectedMessage {
@@ -124,7 +137,7 @@ pub async fn receive_tree(
         coming,
         wanted,
         &state,
-        options,
+        &options,
         limits,
     )
     .await?;
@@ -167,7 +180,7 @@ async fn receive_bodies(
     coming: u64,
     wanted: HashMap<FileId, Wanted>,
     state: &StateHandle,
-    options: ReceiveOptions,
+    options: &ReceiveOptions,
     limits: &Limits,
 ) -> Result<TransferSummary, PipelineError> {
     let plan = TransferPlan::derive(options.mem_budget_bytes, options.jobs);
@@ -218,6 +231,7 @@ async fn receive_bodies(
             pool.clone(),
             Arc::clone(&disk_write),
             Arc::clone(&cpu_jobs),
+            options.progress.clone(),
             *limits,
         ));
     }
@@ -273,6 +287,7 @@ async fn worker(
     pool: BufferPool,
     disk_write: Arc<Semaphore>,
     cpu_jobs: Arc<Semaphore>,
+    progress: Progress,
     limits: Limits,
 ) -> Result<Body, PipelineError> {
     let header = read_data_header(&mut stream).await?;
@@ -313,6 +328,7 @@ async fn worker(
             header.compressed,
             &pool,
             &cpu_jobs,
+            &progress,
             &limits,
         )
         .await?
@@ -354,6 +370,7 @@ async fn worker(
     commit(&partial, &file.target).await?;
     state.forget(file.relative.clone()).await?;
     apply_mode(&file.target, file.mode).await;
+    progress.finished_file();
     tracing::info!(
         path = %file.relative,
         bytes = body.bytes,
@@ -399,7 +416,7 @@ async fn negotiate(
     reader: &mut ControlReader,
     destination: &Path,
     state: &StateHandle,
-    options: ReceiveOptions,
+    options: &ReceiveOptions,
     limits: &Limits,
 ) -> Result<HashMap<FileId, Wanted>, PipelineError> {
     let mut wanted = HashMap::new();
@@ -436,7 +453,7 @@ async fn negotiate(
             let relative = SafeRelPath::from_components(&entry.path, limits)?;
             let target = relative.resolve_under(destination)?;
 
-            let local = inspect(&target, &entry, options).await;
+            let local = inspect(&target, &entry, options.checksum).await;
             let partial = unfinished(&target, &relative, &entry, state).await?;
             let decision = decide(&entry, local, partial);
 
@@ -518,14 +535,14 @@ async fn unfinished(
 }
 
 /// Looks at the local copy, hashing it only when a hash could actually change the answer.
-async fn inspect(target: &Path, entry: &Entry, options: ReceiveOptions) -> Option<LocalFile> {
+async fn inspect(target: &Path, entry: &Entry, checksum: bool) -> Option<LocalFile> {
     let metadata = fs::metadata(target).await.ok()?;
     if !metadata.is_file() {
         return None;
     }
 
     let size = metadata.len();
-    let worth_hashing = size == entry.size && (entry.hash.is_some() || options.checksum);
+    let worth_hashing = size == entry.size && (entry.hash.is_some() || checksum);
 
     let hash = if worth_hashing {
         let path = target.to_path_buf();
@@ -563,6 +580,11 @@ struct Body {
 ///
 /// `compressed` comes from the stream's own header, never from this side's configuration:
 /// the sender decided per file and only it knows what it did.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each one is a distinct collaborator with a single owner; bundling them would \
+              only hide who holds what"
+)]
 async fn write_body(
     mut stream: RecvStream,
     partial: &Path,
@@ -570,6 +592,7 @@ async fn write_body(
     compressed: bool,
     pool: &BufferPool,
     cpu_jobs: &Arc<Semaphore>,
+    progress: &Progress,
     limits: &Limits,
 ) -> Result<Body, PipelineError> {
     if let Some(parent) = partial.parent() {
@@ -617,6 +640,7 @@ async fn write_body(
 
         wire_bytes += read as u64;
         stage.filled(read);
+        let mut chunk_written = 0_u64;
 
         // A compressed buffer can expand into several: each one is written before the next
         // is produced, so a peer cannot make this side hold an arbitrary amount of memory
@@ -635,6 +659,7 @@ async fn write_body(
 
             let block = stage.ready();
             written += block.len() as u64;
+            chunk_written += block.len() as u64;
 
             let total = from_offset.saturating_add(written);
             if total > limits.max_file_size_bytes {
@@ -653,6 +678,8 @@ async fn write_body(
                     source,
                 })?;
         }
+
+        progress.advance(chunk_written, read as u64);
     }
 
     // Flush to the device before the rename: a rename that survives a crash while its

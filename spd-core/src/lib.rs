@@ -7,10 +7,11 @@
 //! # Phase status
 //!
 //! The project is built in phases (see `PLAN.md §10`); every phase ends with green CI
-//! and a usable binary. Currently at **F7 - security**: QUIC transport, tree scanning with
+//! and a usable binary. Currently at **F8 - finishing**: QUIC transport, tree scanning with
 //! a hash cache, skip/need negotiation, parallel transfers, interrupted files picked up
-//! where they stopped, bodies compressed when that is worth doing, and a pairing code that
-//! decides who is allowed to send anything at all. Progress output lands in F8.
+//! where they stopped, bodies compressed when that is worth doing, a pairing code that
+//! decides who is allowed to send anything at all, and counters a user interface can draw
+//! without the transfer waiting for it. Property tests and benchmarks land in F9.
 
 // Panicking is a bug in the core: a failure that reaches the user must be a typed error,
 // never an abort. Tests are exempt so assertions stay readable.
@@ -21,6 +22,7 @@
 
 pub mod compress;
 pub mod error;
+pub mod metrics;
 pub mod pipeline;
 pub mod proto;
 pub mod safety;

@@ -56,6 +56,7 @@ pub(crate) const DEFAULT_PORT: u16 = 9432;
 
 /// Options for `spd send`.
 #[derive(Debug, clap::Args)]
+#[command(after_help = SEND_EXAMPLES)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "command-line switches are booleans; grouping them would only hide the surface"
@@ -118,10 +119,58 @@ pub(crate) struct SendArgs {
     /// up where it stopped; anything else fails immediately.
     #[arg(long, default_value_t = RetryPolicy::DEFAULT.attempts.get(), value_name = "N")]
     pub(crate) attempts: u32,
+
+    /// Hold the transfer to this many MiB per second, leaving the link usable for
+    /// everything else on it. Unlimited when not given.
+    #[arg(long, value_name = "MIB")]
+    pub(crate) limit_rate_mb: Option<u64>,
+
+    /// Print what the transfer cost when it ends: bytes, compression, throughput, time.
+    #[arg(long)]
+    pub(crate) stats: bool,
+
+    /// Do not draw a progress bar.
+    #[arg(long)]
+    pub(crate) no_progress: bool,
 }
+
+/// Worked examples, shown under `spd send --help`.
+///
+/// The flags are documented one by one above; what a reader usually wants is the shape of
+/// a whole command, and that is what is missing from a list of switches.
+const SEND_EXAMPLES: &str = "\
+Examples:
+  # The receiver shows a code; type it here.
+  spd send ./photos 192.168.1.20:9432 --code A1B2C-D3E4F
+
+  # See what would move, without moving it.
+  spd send ./photos 192.168.1.20:9432 --code A1B2C-D3E4F --dry-run
+
+  # Leave the link usable for everything else, and say what it cost.
+  spd send ./backup 192.168.1.20:9432 --code A1B2C-D3E4F --limit-rate-mb 20 --stats
+
+  # A trusted network, no code, and content compared by hash rather than timestamp.
+  spd send ./photos 192.168.1.20:9432 --insecure --checksum";
+
+/// Worked examples, shown under `spd recv --help`.
+const RECV_EXAMPLES: &str = "\
+Examples:
+  # Show a pairing code and wait for one transfer.
+  spd recv --out ./inbox
+
+  # A code agreed in advance, on a specific address.
+  spd recv --out ./inbox --listen 0.0.0.0:9432 --code A1B2C-D3E4F
+
+  # A trusted network, with a summary at the end.
+  spd recv --out ./inbox --insecure --stats";
 
 /// Options for `spd recv`.
 #[derive(Debug, clap::Args)]
+#[command(after_help = RECV_EXAMPLES)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "command-line switches are booleans; grouping them would only hide the surface"
+)]
 pub(crate) struct RecvArgs {
     /// Directory to write into. It must already exist.
     #[arg(long, short, default_value = ".", value_name = "DIR")]
@@ -166,6 +215,14 @@ pub(crate) struct RecvArgs {
     /// reconnects finds the listener still waiting and continues where it stopped.
     #[arg(long, default_value_t = RetryPolicy::DEFAULT.attempts.get(), value_name = "N")]
     pub(crate) attempts: u32,
+
+    /// Print what the transfer cost when it ends: bytes, compression, throughput, time.
+    #[arg(long)]
+    pub(crate) stats: bool,
+
+    /// Do not draw a progress bar.
+    #[arg(long)]
+    pub(crate) no_progress: bool,
 }
 
 fn default_listen_address() -> SocketAddr {

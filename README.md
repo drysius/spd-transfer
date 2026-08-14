@@ -3,10 +3,10 @@
 Peer-to-peer file and folder transfer over QUIC. One connection, one stream per file,
 resume by byte offset, BLAKE3 verification end to end.
 
-**Status: early.** Phases F0-F7 are done: it syncs a folder in parallel, verified end to end,
+**Status: early.** Phases F0-F8 are done: it syncs a folder in parallel, verified end to end,
 sending only what changed, compressing what is worth compressing, resuming an interrupted
-transfer where it stopped, and refusing anyone who cannot produce the pairing code. Progress
-output and a bandwidth limit are still ahead. See [`PLAN.md`](PLAN.md).
+transfer where it stopped, refusing anyone who cannot produce the pairing code, and showing
+what it is doing while it does it. See [`PLAN.md`](PLAN.md).
 
 ## Build
 
@@ -45,6 +45,20 @@ Run the same command again later and it does the same thing.
 Bodies are compressed when that is worth doing, decided per file: a folder of source or
 logs crosses at a fraction of its size, a folder of video is not even sampled. `--no-compress`
 turns it off for a link fast enough that the processor is the scarce thing.
+
+`--limit-rate-mb 10` holds the transfer to ten mebibytes a second so the link stays usable,
+and `--stats` says what it cost when it is over:
+
+```
+stats
+  files                    205
+  file bytes               20.7 MiB
+  on the wire              19.6 MiB
+  compression saved        5%
+  scan                     68 ms
+  total                    649 ms
+  throughput               30.2 MiB/s
+```
 
 ```sh
 cargo run -p spd-cli -- doctor
