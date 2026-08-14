@@ -3,16 +3,20 @@
 Peer-to-peer file and folder transfer over QUIC. One connection, one stream per file,
 resume by byte offset, BLAKE3 verification end to end.
 
-**Status: early.** Phases F0-F8 are done: it syncs a folder in parallel, verified end to end,
-sending only what changed, compressing what is worth compressing, resuming an interrupted
-transfer where it stopped, refusing anyone who cannot produce the pairing code, and showing
-what it is doing while it does it. See [`PLAN.md`](PLAN.md).
+**Status: 0.1.0.** It syncs a folder in parallel, verified end to end, sending only what
+changed, compressing what is worth compressing, resuming an interrupted transfer where it
+stopped, refusing anyone who cannot produce the pairing code, and showing what it is doing
+while it does it. What it does and does not do, measured, is in
+[`CHANGELOG.md`](CHANGELOG.md); the design is in [`PLAN.md`](PLAN.md) and the wire format in
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ## Build
 
 ```sh
 cargo build --workspace
 cargo xtask ci        # what CI runs: fmt, clippy -D warnings, tests, docs, cargo-deny
+cargo bench -p spd-core   # hashing, compression, path validation, scanning
+cargo xtask fuzz      # the decoder and the path sanitiser, on nightly
 ```
 
 ## Try what exists

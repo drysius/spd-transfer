@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F8 (finishing) done. F9 (hardening) next.
+**Status:** F0-F9 done. Version 0.1.0 - see `CHANGELOG.md`.
 **Last updated:** 2026-08-14
 
 ---
@@ -542,9 +542,21 @@ not draw one bar per stream: per-file detail is already an `--log-level debug` l
 carrying the path, the bytes and where it resumed from, and a second mechanism for the same
 information would be a second thing to keep true.
 
-### F9 - Hardening
+### F9 - Hardening - **done**
 Property tests, `criterion` benchmarks, cross-version interop test (golden wire-format
 files), protocol documentation, release notes.
+Shipped: `tests/properties.rs` - a path is either refused or resolves inside the root, an
+accepted path survives the round trip it will actually make, every control message survives
+encoding, arbitrary bytes never panic the decoder, a resume offset never points past the end
+of the file, and a matching hash always settles it; `tests/interop.rs` with the wire format
+frozen in `tests/golden/`, regenerated only on purpose with `SPD_UPDATE_GOLDEN=1`;
+`benches/transfer.rs`; `docs/PROTOCOL.md`; and `CHANGELOG.md`.
+Measured on this machine: BLAKE3 over 1 MiB from disk 462 µs (2.1 GiB/s), the compression
+sample 28 µs on text and 81 µs on noise, zstd over 1 MiB of text 722 µs (1.35 GiB/s),
+validating a path 335 ns, walking 200 files 8.8 ms.
+End-to-end throughput is not a criterion benchmark. It is a property of the disk and the
+link rather than of this code, and a number that moves with whatever else the machine is
+doing teaches nothing; the figures under F4 stand instead.
 
 ---
 

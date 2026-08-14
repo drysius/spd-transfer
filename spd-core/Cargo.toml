@@ -32,6 +32,12 @@ zstd.workspace = true
 # limiter's behaviour is measured in seconds, and a suite that waits them out is a suite
 # nobody runs.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "transfer"
+harness = false
 
 [lints]
 workspace = true

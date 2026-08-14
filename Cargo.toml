@@ -18,11 +18,15 @@ anyhow = "1"
 blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+# No plotting backend: a benchmark that draws charts pulls in half a graphics stack and
+# nobody looks at the SVGs. The numbers on stdout are the point.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom = "0.3"
 indicatif = "0.18"
 jwalk = "0.8"
 postcard = { version = "1", features = ["use-std"] }
+proptest = "1"
 # ring rather than aws-lc-rs: it builds without cmake/nasm, which keeps the Windows
 # leg of the CI matrix from needing extra toolchain setup.
 quinn = { version = "0.11", default-features = false, features = [

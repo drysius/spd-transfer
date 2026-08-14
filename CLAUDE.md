@@ -42,6 +42,14 @@ Two skills carry the detail and apply to every change here:
 `.claude/skills/rust-clean-code` (structure) and `.claude/skills/rust-to-humans` (naming,
 docs, error wording). Load them when writing or reviewing Rust.
 
+## Where things are written down
+
+- `PLAN.md` - the design, the phases, and what each one actually shipped.
+- `docs/PROTOCOL.md` - the wire format, for someone implementing the other end.
+- `CHANGELOG.md` - what a release does, measured, with its known limitations.
+- `spd-core/tests/golden/` - the wire format in bytes. Regenerate on purpose only:
+  `SPD_UPDATE_GOLDEN=1 cargo test -p spd-core --test interop`.
+
 ## Phase status
 
 F0-F7 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport,
@@ -49,12 +57,12 @@ verified transfers (`SafeRelPath`, `.part` plus atomic rename), folder sync with
 cache, parallel transfers (work queue, buffer pool, `--streams`, `--mem-budget-mb`),
 resume (state actor over a journal in `.spd`, offset resume, reconnection with backoff,
 `--attempts`), zstd compression decided per file (`--no-compress`, `--cpu-jobs`), pairing
-(`--code`, proof bound to the TLS session; `--insecure` still exists and still warns) and
-the finishing pass (progress bar, `--stats`, `--limit-rate-mb`). F9 is hardening - see
-`PLAN.md §10`.
+(`--code`, proof bound to the TLS session; `--insecure` still exists and still warns), the
+finishing pass (progress bar, `--stats`, `--limit-rate-mb`) and hardening (property tests,
+frozen wire format, benchmarks, protocol documentation).
 
-Nothing lands for a future phase ahead of time; each phase ends with green CI and a usable
-binary.
+That is version 0.1.0. Anything beyond it is a new phase in `PLAN.md` before it is code,
+and each phase still ends with green CI and a usable binary.
 
 ## Editing note (Windows)
 
