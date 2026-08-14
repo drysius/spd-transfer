@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F1 (transport) done. F2 (single file) next.
+**Status:** F2 (single file) done. F3 (manifest and diff) next.
 **Last updated:** 2026-08-14
 
 ---
@@ -420,11 +420,14 @@ Shipped: ALPN `spd/1`, TLS 1.3 with `TrustPolicy`, typed `ControlChannel`, data-
 headers bounded before allocation, handshake timeouts, and a refusal that reaches the peer
 carrying its reason.
 
-### F2 - One file
+### F2 - One file - **done**
 Sending and receiving a single file. No compression, no parallelism. `.part` -> BLAKE3 ->
 end-to-end verification -> atomic rename.
 **Done when:** a 1 GB file crosses with a matching hash; an injected corrupt byte is
 detected and reported.
+Shipped: `SafeRelPath` (validated before anything touches the filesystem), `spd send` /
+`spd recv`, `.part` plus atomic rename, a graceful close so the final message is not
+discarded, and `--insecure` as a required, explicit choice.
 
 ### F3 - Manifest and diff
 Parallel walk, hash cache, batched manifest, `Skip`/`Need`, `--dry-run`.

@@ -4,6 +4,9 @@
 //! belongs to `spd-core`, so the same behaviour is reachable from a test without going
 //! through `clap`.
 
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// Peer-to-peer file and folder transfer over QUIC.
@@ -35,9 +38,56 @@ pub(crate) enum LogFormat {
 /// Available subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Send a file to a waiting peer.
+    Send(SendArgs),
+
+    /// Wait for a peer and receive into a directory.
+    Recv(RecvArgs),
+
     /// Show the effective limits and the concurrency they produce, without touching the
     /// network.
     Doctor(DoctorArgs),
+}
+
+/// Port used when none is given. Unassigned by IANA, and easy to remember.
+pub(crate) const DEFAULT_PORT: u16 = 9432;
+
+/// Options for `spd send`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct SendArgs {
+    /// File to send.
+    #[arg(value_name = "FILE")]
+    pub(crate) file: PathBuf,
+
+    /// Where the receiver is listening, as `host:port`.
+    #[arg(value_name = "ADDRESS")]
+    pub(crate) address: SocketAddr,
+
+    /// Accept any peer without verifying who it is. Traffic stays encrypted; nothing
+    /// proves the receiver is the machine you meant. Required until pairing exists.
+    #[arg(long)]
+    pub(crate) insecure: bool,
+}
+
+/// Options for `spd recv`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct RecvArgs {
+    /// Directory to write into. It must already exist.
+    #[arg(long, short, default_value = ".", value_name = "DIR")]
+    pub(crate) out: PathBuf,
+
+    /// Address to listen on.
+    #[arg(long, default_value_t = default_listen_address(), value_name = "ADDRESS")]
+    pub(crate) listen: SocketAddr,
+
+    /// Accept any peer without verifying who it is. Traffic stays encrypted; nothing
+    /// proves the sender is who you expect. Required until pairing exists.
+    #[arg(long)]
+    pub(crate) insecure: bool,
+}
+
+fn default_listen_address() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))
 }
 
 /// Options for `spd doctor`.

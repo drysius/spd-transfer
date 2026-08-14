@@ -6,6 +6,9 @@
 
 mod args;
 mod doctor;
+mod recv;
+mod send;
+mod trust;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -14,11 +17,14 @@ use tracing_subscriber::EnvFilter;
 
 use crate::args::{Cli, Command, LogFormat};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(&cli.log_level, cli.log_format)?;
 
     match &cli.command {
+        Command::Send(args) => send::run(args).await,
+        Command::Recv(args) => recv::run(args).await,
         Command::Doctor(args) => doctor::run(args),
     }
 }

@@ -10,6 +10,7 @@ repository.workspace = true
 # Dependency rule (checked by CI): no UI crates here.
 # Forbidden: clap, indicatif, anyhow.
 [dependencies]
+blake3.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true

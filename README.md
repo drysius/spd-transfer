@@ -3,9 +3,8 @@
 Peer-to-peer file and folder transfer over QUIC. One connection, one stream per file,
 resume by byte offset, BLAKE3 verification end to end.
 
-**Status: early.** Phases F0-F1 are done - limits, version negotiation, memory-budget model,
-CI, and the QUIC transport with its handshake. Moving files lands in F2. See
-[`PLAN.md`](PLAN.md).
+**Status: early.** Phases F0-F2 are done: it moves one file, verified end to end. Folder
+sync, parallelism, resume and compression are still ahead. See [`PLAN.md`](PLAN.md).
 
 ## Build
 
@@ -15,6 +14,19 @@ cargo xtask ci        # what CI runs: fmt, clippy -D warnings, tests, docs, carg
 ```
 
 ## Try what exists
+
+Send one file between two terminals:
+
+```sh
+# receiver
+spd recv --out ./inbox --listen 0.0.0.0:9432 --insecure
+
+# sender
+spd send ./holiday.mp4 192.168.1.20:9432 --insecure
+```
+
+`--insecure` is required and not a default: it encrypts the traffic but does not prove who
+the other side is. Pairing arrives in F7, and until then the choice is explicit.
 
 ```sh
 cargo run -p spd-cli -- doctor

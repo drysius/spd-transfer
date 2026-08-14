@@ -32,6 +32,7 @@ pub struct Session {
     connection: Connection,
     control: ControlChannel,
     peer: PeerInfo,
+    limits: Limits,
 }
 
 /// Shows who the session is with. The stream machinery underneath has no readable
@@ -76,7 +77,13 @@ impl Session {
                 device: peer_device,
             } => {
                 let agreed = negotiate(version, features)?;
-                Ok(Self::assemble(connection, control, agreed, peer_device))
+                Ok(Self::assemble(
+                    connection,
+                    control,
+                    agreed,
+                    peer_device,
+                    limits,
+                ))
             }
             // The peer refused us and said why; carry its wording out instead of
             // reporting the connection drop that follows.
@@ -147,7 +154,13 @@ impl Session {
             })
             .await?;
 
-        Ok(Self::assemble(connection, control, agreed, peer_device))
+        Ok(Self::assemble(
+            connection,
+            control,
+            agreed,
+            peer_device,
+            limits,
+        ))
     }
 
     /// Who this session is with.
@@ -183,12 +196,24 @@ impl Session {
             .map_err(|source| TransportError::Connection { source })
     }
 
-    /// Closes the connection, telling the peer why.
+    /// Closes the connection immediately, telling the peer why.
     ///
     /// The reason travels in the QUIC close frame, so the other side can print something
-    /// better than "connection reset".
+    /// better than "connection reset". Anything still in flight is discarded - use
+    /// [`Self::close_gracefully`] after sending a message the peer is expected to read.
     pub fn close(&self, reason: &str) {
         self.connection.close(0_u32.into(), reason.as_bytes());
+    }
+
+    /// Flushes the control stream and waits for the peer to hang up before closing.
+    ///
+    /// Closing straight after a final message drops it: QUIC discards buffered stream
+    /// data on close, so the peer sees a connection loss where it was waiting for `Done`.
+    /// Waiting for its hangup means the last message is delivered before the connection
+    /// goes away.
+    pub async fn close_gracefully(&mut self, reason: &str) {
+        linger_until_peer_leaves(&self.connection, &mut self.control, &self.limits).await;
+        self.close(reason);
     }
 
     fn assemble(
@@ -196,6 +221,7 @@ impl Session {
         control: ControlChannel,
         negotiated: Negotiated,
         device: DeviceId,
+        limits: &Limits,
     ) -> Self {
         let address = connection.remote_address();
         tracing::info!(%device, %address, version = negotiated.version, "session established");
@@ -208,6 +234,7 @@ impl Session {
                 negotiated,
                 address,
             },
+            limits: *limits,
         }
     }
 }

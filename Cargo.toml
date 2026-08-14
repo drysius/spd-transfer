@@ -12,6 +12,7 @@ repository = "https://github.com/Drysius/spd-transfer"
 [workspace.dependencies]
 spd-core = { path = "spd-core" }
 anyhow = "1"
+blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
@@ -28,13 +29,13 @@ rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "fs"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Regra do projeto: warning é erro no CI (`-D warnings`). Lint novo entra aqui,
-# nunca como `#[allow]` espalhado pelo código.
+# Project rule: a warning is an error in CI (`-D warnings`). A new lint is configured
+# here, never as an `#[allow]` scattered through the code.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
