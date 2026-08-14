@@ -42,10 +42,17 @@ pub struct WalkOptions {
 ///
 /// A single file as `root` is a tree of one, so callers do not need a separate path for it.
 ///
+/// A file that disappears between being listed and being measured is skipped. Trees are
+/// live: editors write and rename, servers churn through temporary files, and a scan that
+/// refuses to send ten thousand files because one of them stopped existing is refusing the
+/// one job it had.
+///
 /// # Errors
-/// [`ScanError::Unreadable`] if the root cannot be read, [`ScanError::Path`] if a name
-/// under it cannot cross safely - a file the receiver could not name is a failure to
-/// report, not something to skip silently.
+/// [`ScanError::Unreadable`] if the root cannot be read, or if a file under it cannot be
+/// read for any reason other than no longer being there - a permission denied is a file the
+/// user asked to send and will not get. [`ScanError::Path`] if a name under it cannot cross
+/// safely: a file the receiver could not name is a failure to report, not something to skip
+/// silently.
 pub fn walk(
     root: &Path,
     options: WalkOptions,
@@ -66,10 +73,21 @@ pub fn walk(
         .follow_links(options.follow_links)
         .skip_hidden(false)
     {
-        let entry = entry.map_err(|source| ScanError::Unreadable {
-            path: root.to_path_buf(),
-            source: source.into(),
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            // A directory that went away while it was being walked is not a failure to
+            // report: there is nothing under it left to send.
+            Err(gone) if vanished(gone.io_error()) => {
+                tracing::debug!(%gone, "a directory disappeared while the tree was listed");
+                continue;
+            }
+            Err(source) => {
+                return Err(ScanError::Unreadable {
+                    path: root.to_path_buf(),
+                    source: source.into(),
+                });
+            }
+        };
 
         // Directories are implied by the files inside them, and an empty directory carries
         // no data worth a protocol round trip.
@@ -85,10 +103,24 @@ pub fn walk(
         if is_state_path(&path, root) {
             continue;
         }
-        let metadata = entry.metadata().map_err(|source| ScanError::Unreadable {
-            path: path.clone(),
-            source: source.into(),
-        })?;
+
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            // Listed a moment ago and gone now. Live trees do this constantly - editors
+            // write and rename, servers churn through temporary files - and refusing to
+            // send ten thousand files because one of them was never going to be sent is
+            // the wrong answer.
+            Err(gone) if vanished(gone.io_error()) => {
+                tracing::debug!(path = %path.display(), "skipping a file that disappeared mid-scan");
+                continue;
+            }
+            Err(source) => {
+                return Err(ScanError::Unreadable {
+                    path: path.clone(),
+                    source: source.into(),
+                });
+            }
+        };
 
         found.push(describe(&path, root, &metadata, limits)?);
     }
@@ -101,6 +133,15 @@ pub fn walk(
     });
 
     Ok(found)
+}
+
+/// Whether an error means the thing is simply not there any more.
+///
+/// Only this exact case is tolerated. A permission denied, a failing disk or a path too
+/// long are all things the user needs to hear about, because each of them means a file
+/// they asked to send is not going to be sent.
+fn vanished(error: Option<&std::io::Error>) -> bool {
+    error.is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Whether this path lives inside spd's own state directory.
@@ -201,6 +242,49 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].relative.to_string(), "only.bin");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_a_missing_file_is_tolerated() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(vanished(Some(&Error::from(ErrorKind::NotFound))));
+        assert!(!vanished(Some(&Error::from(ErrorKind::PermissionDenied))));
+        assert!(!vanished(Some(&Error::other("the disk gave up"))));
+        assert!(!vanished(None));
+    }
+
+    /// A tree being written to while it is listed is the normal case on a server, and it
+    /// used to fail the whole transfer: one temporary file that existed when the directory
+    /// was read and was gone a moment later was enough.
+    ///
+    /// The deletions race the walk on purpose. The assertion only fails if the walk reports
+    /// a file that is not there as an error, so a run where the race does not happen passes
+    /// quietly rather than flaking.
+    #[test]
+    fn files_disappearing_mid_scan_do_not_fail_the_walk() {
+        let root = scratch("vanishing");
+        for index in 0..400 {
+            std::fs::write(root.join(format!("file-{index}.tmp")), b"temporary").unwrap();
+        }
+
+        let deleting = root.clone();
+        let deleter = std::thread::spawn(move || {
+            for index in 0..400 {
+                let _ = std::fs::remove_file(deleting.join(format!("file-{index}.tmp")));
+            }
+        });
+
+        let walked = walk(&root, WalkOptions::default(), &Limits::DEFAULT);
+        deleter.join().unwrap();
+
+        assert!(
+            walked.is_ok(),
+            "a file that stopped existing is not a reason to refuse the tree: {:?}",
+            walked.err()
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }

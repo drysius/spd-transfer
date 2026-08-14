@@ -376,13 +376,7 @@ async fn worth_compressing(
         return Ok(false);
     }
 
-    let mut file = File::open(&need.source)
-        .await
-        .map_err(|source| PipelineError::Io {
-            operation: "opening",
-            path: need.source.clone(),
-            source,
-        })?;
+    let mut file = open_source(&need.source).await?;
 
     let mut sample = pool.acquire().await;
     let wanted = sample.bytes().len().min(compress::SAMPLE_BYTES);
@@ -408,6 +402,27 @@ async fn worth_compressing(
     tracing::debug!(path = %need.source.display(), compress = verdict, "compression decided");
 
     Ok(verdict)
+}
+
+/// Opens a file the receiver asked for, telling a vanished one apart from a broken one.
+///
+/// The tree was listed at some point before this, and on a machine that is doing anything
+/// else the two are not the same moment. A file that is simply gone is a different problem
+/// from a disk that will not read it, and only one of the two is worth trying again.
+async fn open_source(path: &Path) -> Result<File, PipelineError> {
+    File::open(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PipelineError::SourceVanished {
+                path: path.to_path_buf(),
+            }
+        } else {
+            PipelineError::Io {
+                operation: "opening",
+                path: path.to_path_buf(),
+                source: error,
+            }
+        }
+    })
 }
 
 /// A closed CPU semaphore means the transfer is already shutting down.
@@ -669,13 +684,7 @@ async fn stream_body(
     options: &SendOptions,
 ) -> Result<Sent, PipelineError> {
     let source = need.source.as_path();
-    let mut file = File::open(source)
-        .await
-        .map_err(|error| PipelineError::Io {
-            operation: "opening",
-            path: source.to_path_buf(),
-            source: error,
-        })?;
+    let mut file = open_source(source).await?;
 
     let mut hasher = blake3::Hasher::new();
 

@@ -131,6 +131,17 @@ pub enum PipelineError {
         agreed: u64,
     },
 
+    /// A file was there when the tree was listed and is not there now.
+    ///
+    /// Recoverable on purpose. The next attempt scans again, the file is simply not in the
+    /// manifest any more, and everything already transferred is skipped - so a tree being
+    /// written to while it is sent converges instead of failing.
+    #[error("{path} disappeared between being listed and being sent")]
+    SourceVanished {
+        /// The file that went away.
+        path: PathBuf,
+    },
+
     /// A file on disk is shorter than the offset the transfer agreed to resume from.
     ///
     /// It changed between being measured and being read - the source was rewritten, or a
@@ -174,13 +185,16 @@ impl PipelineError {
     /// Whether trying again on a new connection could succeed.
     ///
     /// True for anything that is the connection's fault: what is already on disk stays a
-    /// valid prefix, so a second attempt resumes rather than starting over. False for
-    /// everything a retry would only repeat - a refused path, a failing disk, a peer
-    /// speaking nonsense, a pairing code that does not match, or bytes that arrived and
-    /// did not match.
+    /// valid prefix, so a second attempt resumes rather than starting over. True as well
+    /// for a source file that vanished, because the next attempt rescans and simply does
+    /// not offer it. False for everything a retry would only repeat - a refused path, a
+    /// failing disk, a peer speaking nonsense, a pairing code that does not match, or
+    /// bytes that arrived and did not match.
     pub const fn is_recoverable(&self) -> bool {
         match self {
-            Self::Stream { .. } | Self::Proto(ProtoError::PeerClosed | ProtoError::Io(_)) => true,
+            Self::Stream { .. }
+            | Self::SourceVanished { .. }
+            | Self::Proto(ProtoError::PeerClosed | ProtoError::Io(_)) => true,
             Self::Transport(transport) => transport.is_recoverable(),
             _ => false,
         }
@@ -212,6 +226,18 @@ mod tests {
         assert!(
             !refused.is_recoverable(),
             "a wrong code is wrong every time, and retrying it is four more guesses"
+        );
+    }
+
+    #[test]
+    fn a_file_that_vanished_is_worth_rescanning_for() {
+        let gone = PipelineError::SourceVanished {
+            path: PathBuf::from("server/tmp/profile.jfr.tmp"),
+        };
+
+        assert!(
+            gone.is_recoverable(),
+            "the next scan simply will not offer it, so the retry is the fix"
         );
     }
 

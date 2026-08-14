@@ -3,6 +3,29 @@
 Kept by hand, in the order a reader cares about rather than the order the commits landed.
 Dates are the day the work was finished.
 
+## Unreleased
+
+### Fixed
+
+- **A live tree no longer fails the whole transfer.** A file that existed when the directory
+  was listed and was gone a moment later - a server writing temporary files, an editor
+  saving - aborted everything with `No such file or directory`. The scan now skips it, and
+  a file that disappears between the scan and being opened is a recoverable error: the next
+  attempt rescans, does not offer it, and skips everything already transferred. Only a
+  missing file is tolerated; a permission denied or a failing disk is still reported,
+  because each of those is a file the user asked to send and will not get.
+
+### Known, not yet fixed
+
+- **Throughput is capped by QUIC's default flow-control windows**, not by the link. quinn
+  sizes them for a 100 ms round trip and 12.5 MB/s per stream: 1.25 MB per stream, 10 MB
+  per connection. On a fast link that is the ceiling - roughly `streams × 1.25 MB ÷ RTT`,
+  and never more than `10 MB ÷ RTT` in total. Raising `--streams` and `--disk-read-jobs`
+  works around the first; the second needs the windows to be sized from `--mem-budget-mb`.
+- **`--disk-read-jobs` silently caps `--streams`.** Its permit is held for a whole file, so
+  the default of 4 means four files move at once however many streams were asked for. It is
+  the right default for a spinning disk and the wrong one for anything else.
+
 ## 0.1.0 - 2026-08-14
 
 First usable release. Peer-to-peer file and folder transfer over QUIC, verified end to end.

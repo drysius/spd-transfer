@@ -1,4 +1,5 @@
 /target
+/dist
 **/*.rs.bk
 
 # Estado local do próprio spd (journal, snapshot, cache de hash)
