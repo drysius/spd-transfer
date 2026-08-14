@@ -7,27 +7,32 @@
 //!
 //! The conversation is always the same shape, whether it carries one file or ten thousand:
 //! manifest batches, one reply each, an announcement of what is coming, then the bodies.
+//! Bodies move in parallel; the control stream stays single-owner, with workers posting to
+//! it through an outbox.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::task::JoinSet;
 
+use crate::pipeline::budget::{DEFAULT_MEM_BUDGET_BYTES, JobLimits, TransferPlan};
+use crate::pipeline::bufpool::BufferPool;
+use crate::pipeline::control::{Outbox, spawn_outbox};
 use crate::pipeline::{PipelineError, TransferSummary};
-use crate::proto::codec::write_data_header;
+use crate::proto::codec::{ControlReader, ControlWriter, write_data_header};
 use crate::proto::messages::{Control, DataHeader, Decision, FileId};
 use crate::safety::limits::Limits;
 use crate::scan::hash_cache::{HASH_SIZE_CEILING_BYTES, HashCache, hash_file};
 use crate::scan::manifest::{Manifest, ManifestFile, batches};
 use crate::scan::walk::{WalkOptions, walk};
-use crate::transport::session::Session;
-
-/// Size of one read from disk. Replaced by the pooled buffers of F4; until then it is a
-/// single allocation reused for the whole file.
-const READ_CHUNK_BYTES: usize = 1024 * 1024;
+use crate::transport::session::{Session, Streams};
 
 /// How the sender should behave.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendOptions {
     /// Follow symlinks while scanning.
     pub follow_links: bool,
@@ -39,6 +44,24 @@ pub struct SendOptions {
     /// Run the whole negotiation and report what would move, without opening a single data
     /// stream.
     pub dry_run: bool,
+
+    /// Memory the transfer may hold, in bytes. Concurrency follows from this.
+    pub mem_budget_bytes: u64,
+
+    /// Explicit ceilings on concurrent work.
+    pub jobs: JobLimits,
+}
+
+impl Default for SendOptions {
+    fn default() -> Self {
+        Self {
+            follow_links: false,
+            checksum: false,
+            dry_run: false,
+            mem_budget_bytes: DEFAULT_MEM_BUDGET_BYTES,
+            jobs: JobLimits::DEFAULT,
+        }
+    }
 }
 
 /// What a send worked out and then did.
@@ -52,14 +75,17 @@ pub struct SendReport {
     pub skipped: u64,
 }
 
-/// Sends a file or a whole directory tree over an established session.
+/// Sends a file or a whole directory tree, then closes the session.
+///
+/// Takes the session by value: once the transfer is over the connection has to be closed
+/// in the right order, and leaving that to the caller is how the last message gets lost.
 ///
 /// # Errors
 /// [`PipelineError::Io`] if the tree cannot be read, [`PipelineError::HashMismatch`] if the
 /// receiver rejects a file, [`PipelineError::UnexpectedMessage`] if the peer answers out of
 /// order, or a transport error if the connection fails.
 pub async fn send_tree(
-    session: &mut Session,
+    session: Session,
     root: &Path,
     options: SendOptions,
     limits: &Limits,
@@ -71,7 +97,9 @@ pub async fn send_tree(
         "offering"
     );
 
-    let needed = negotiate(session, &manifest, limits).await?;
+    let mut parts = session.split();
+    let needed = negotiate(&mut parts.writer, &mut parts.reader, &manifest, limits).await?;
+
     let planned = TransferSummary {
         files: needed.len() as u64,
         bytes: needed
@@ -81,47 +109,36 @@ pub async fn send_tree(
     };
     let skipped = manifest.len() as u64 - planned.files;
 
-    if options.dry_run {
+    let transferred = if options.dry_run {
         // Announce nothing, so the receiver stops waiting instead of holding a connection
         // open for streams that are not coming.
-        session
-            .control()
+        parts
+            .writer
             .send(&Control::Transfer { files: 0, bytes: 0 })
             .await?;
-        session
-            .control()
+        parts
+            .writer
             .send(&Control::Done { files: 0, bytes: 0 })
             .await?;
+        parts.writer.close().await?;
 
-        return Ok(SendReport {
-            transferred: TransferSummary::default(),
-            planned,
-            skipped,
-        });
-    }
+        TransferSummary::default()
+    } else {
+        parts
+            .writer
+            .send(&Control::Transfer {
+                files: planned.files,
+                bytes: planned.bytes,
+            })
+            .await?;
 
-    session
-        .control()
-        .send(&Control::Transfer {
-            files: planned.files,
-            bytes: planned.bytes,
-        })
-        .await?;
+        run_workers(&parts.streams, parts.writer, parts.reader, needed, options).await?
+    };
 
-    let mut transferred = TransferSummary::default();
-    for need in &needed {
-        send_one(session, need).await?;
-        transferred.files += 1;
-        transferred.bytes = transferred.bytes.saturating_add(need.remaining);
-    }
-
-    session
-        .control()
-        .send(&Control::Done {
-            files: transferred.files,
-            bytes: transferred.bytes,
-        })
-        .await?;
+    parts
+        .streams
+        .close_gracefully("transfer complete", limits.handshake_timeout)
+        .await;
 
     Ok(SendReport {
         transferred,
@@ -137,6 +154,184 @@ struct Needed {
     source: PathBuf,
     from_offset: u64,
     remaining: u64,
+}
+
+/// Runs the bodies in parallel and collects the verdicts.
+///
+/// Three roles, three owners: workers stream files, one task owns the control writer, one
+/// task reads replies and hands each verdict to whoever is waiting for that file.
+async fn run_workers(
+    streams: &Streams,
+    writer: ControlWriter,
+    reader: ControlReader,
+    needed: Vec<Needed>,
+    options: SendOptions,
+) -> Result<TransferSummary, PipelineError> {
+    let plan = TransferPlan::derive(options.mem_budget_bytes, options.jobs);
+    tracing::info!(
+        workers = plan.workers.get(),
+        reserved_bytes = plan.reserved_bytes(),
+        "starting transfer"
+    );
+
+    // Every verdict has somewhere to go before the first file is sent, so a fast peer
+    // cannot answer before its worker is listening.
+    let mut awaiting = HashMap::new();
+    let mut queue = VecDeque::with_capacity(needed.len());
+    for need in needed {
+        let (answer, wait) = oneshot::channel();
+        awaiting.insert(need.file_id, answer);
+        queue.push_back((need, wait));
+    }
+
+    let (outbox, writer_task) = spawn_outbox(writer);
+    let reader_task = tokio::spawn(route_verdicts(reader, awaiting));
+
+    let pool = BufferPool::new(plan.buffers, plan.buffer_bytes);
+    let disk_read = Arc::new(Semaphore::new(plan.disk_read_jobs.get() as usize));
+    let queue = Arc::new(Mutex::new(queue));
+
+    let mut workers = JoinSet::new();
+    for _ in 0..plan.workers.get() {
+        workers.spawn(worker(
+            streams.clone(),
+            outbox.clone(),
+            Arc::clone(&queue),
+            pool.clone(),
+            Arc::clone(&disk_read),
+        ));
+    }
+
+    let mut transferred = TransferSummary::default();
+    let mut failure = None;
+
+    while let Some(joined) = workers.join_next().await {
+        match joined {
+            Ok(Ok(summary)) => {
+                transferred.files += summary.files;
+                transferred.bytes = transferred.bytes.saturating_add(summary.bytes);
+            }
+            // Keep the first failure and let the others finish: aborting mid-flight would
+            // leave streams half written and the peer waiting on them.
+            Ok(Err(error)) => failure = failure.or(Some(error)),
+            Err(joined) => {
+                failure = failure.or(Some(PipelineError::Io {
+                    operation: "running a transfer worker",
+                    path: PathBuf::new(),
+                    source: std::io::Error::other(joined),
+                }));
+            }
+        }
+    }
+
+    if let Some(error) = failure {
+        return Err(error);
+    }
+
+    outbox
+        .send(Control::Done {
+            files: transferred.files,
+            bytes: transferred.bytes,
+        })
+        .await?;
+
+    // Dropping every outbox is what tells the writer task to flush and finish.
+    drop(outbox);
+    join_control(writer_task, reader_task).await?;
+
+    Ok(transferred)
+}
+
+/// A queue of files still to send, with the reply slot each one is waiting on.
+type WorkQueue = Arc<Mutex<VecDeque<(Needed, oneshot::Receiver<bool>)>>>;
+
+/// Pulls files from the shared queue until it is empty.
+async fn worker(
+    streams: Streams,
+    outbox: Outbox,
+    queue: WorkQueue,
+    pool: BufferPool,
+    disk_read: Arc<Semaphore>,
+) -> Result<TransferSummary, PipelineError> {
+    let mut summary = TransferSummary::default();
+
+    loop {
+        let Some((need, verdict)) = queue.lock().await.pop_front() else {
+            return Ok(summary);
+        };
+
+        let hash = {
+            // The permit is held only while the file is being read, so a worker waiting
+            // for a verdict is not also holding a disk slot.
+            let _permit = disk_read.acquire().await;
+            stream_body(&streams, &need, &pool).await?
+        };
+
+        outbox
+            .send(Control::FileDone {
+                file_id: need.file_id,
+                hash,
+            })
+            .await?;
+
+        // A dropped sender means the reader task stopped, which it only does on a failure
+        // it already reported.
+        let accepted = verdict.await.unwrap_or(false);
+        if !accepted {
+            return Err(PipelineError::HashMismatch { path: need.source });
+        }
+
+        summary.files += 1;
+        summary.bytes = summary.bytes.saturating_add(need.remaining);
+    }
+}
+
+/// Reads replies and hands each verdict to the worker waiting for that file.
+async fn route_verdicts(
+    mut reader: ControlReader,
+    mut awaiting: HashMap<FileId, oneshot::Sender<bool>>,
+) -> Result<(), PipelineError> {
+    while !awaiting.is_empty() {
+        match reader.recv().await? {
+            Control::FileVerdict { file_id, ok } => {
+                let Some(answer) = awaiting.remove(&file_id) else {
+                    return Err(PipelineError::UnknownFile { file_id });
+                };
+                // The worker may already have given up; its verdict then has nowhere to go
+                // and the error it reported stands.
+                let _ = answer.send(ok);
+            }
+            Control::Error { msg, .. } => return Err(PipelineError::PeerFailed { msg }),
+            other => {
+                return Err(PipelineError::UnexpectedMessage {
+                    expected: "FileVerdict",
+                    got: other.kind(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Waits for the writer and reader tasks, turning a panic into a reported error.
+///
+/// The writer goes first: its failure means the last message never left, which explains
+/// anything the reader then reports.
+async fn join_control(
+    writer: tokio::task::JoinHandle<Result<(), crate::proto::codec::ProtoError>>,
+    reader: tokio::task::JoinHandle<Result<(), PipelineError>>,
+) -> Result<(), PipelineError> {
+    writer.await.map_err(joined_error)??;
+    reader.await.map_err(joined_error)?
+}
+
+fn joined_error(joined: tokio::task::JoinError) -> PipelineError {
+    PipelineError::Io {
+        operation: "running the control task",
+        path: PathBuf::new(),
+        source: std::io::Error::other(joined),
+    }
 }
 
 /// Scans the tree and fills in the hashes that are cheap to know.
@@ -197,11 +392,7 @@ async fn build_manifest(
         Ok::<Manifest, crate::scan::manifest::ScanError>(manifest)
     })
     .await
-    .map_err(|joined| PipelineError::Io {
-        operation: "scanning",
-        path: PathBuf::new(),
-        source: std::io::Error::other(joined),
-    })??;
+    .map_err(joined_error)??;
 
     Ok(manifest)
 }
@@ -212,12 +403,20 @@ fn should_hash(file: &ManifestFile, options: SendOptions) -> bool {
 
 /// Offers the manifest in batches and collects what the receiver wants.
 async fn negotiate(
-    session: &mut Session,
+    writer: &mut ControlWriter,
+    reader: &mut ControlReader,
     manifest: &Manifest,
     limits: &Limits,
 ) -> Result<Vec<Needed>, PipelineError> {
-    let wire_batches = batches(manifest, limits.max_manifest_entries);
-    let total_batches = wire_batches.len().max(1);
+    let mut wire_batches = batches(manifest, limits.max_manifest_entries);
+
+    // An empty tree still needs one exchange: the receiver learns there is nothing coming
+    // from the batch marked last.
+    if wire_batches.is_empty() {
+        wire_batches.push(Vec::new());
+    }
+
+    let total_batches = wire_batches.len();
     let mut needed = Vec::new();
 
     for (index, entries) in wire_batches.into_iter().enumerate() {
@@ -227,8 +426,7 @@ async fn negotiate(
         let batch_seq = u32::try_from(index).unwrap_or(u32::MAX);
         let last = index + 1 == total_batches;
 
-        session
-            .control()
+        writer
             .send(&Control::Manifest {
                 batch_seq,
                 last,
@@ -236,33 +434,19 @@ async fn negotiate(
             })
             .await?;
 
-        collect_decisions(session, manifest, batch_seq, &mut needed).await?;
-    }
-
-    // An empty tree still needs one exchange: the receiver has to learn there is nothing
-    // coming, and it learns that from the last batch.
-    if manifest.is_empty() {
-        session
-            .control()
-            .send(&Control::Manifest {
-                batch_seq: 0,
-                last: true,
-                entries: Vec::new(),
-            })
-            .await?;
-        collect_decisions(session, manifest, 0, &mut needed).await?;
+        collect_decisions(reader, manifest, batch_seq, &mut needed).await?;
     }
 
     Ok(needed)
 }
 
 async fn collect_decisions(
-    session: &mut Session,
+    reader: &mut ControlReader,
     manifest: &Manifest,
     batch_seq: u32,
     needed: &mut Vec<Needed>,
 ) -> Result<(), PipelineError> {
-    let reply = session.control().recv().await?;
+    let reply = reader.recv().await?;
 
     let Control::SyncReply {
         batch_seq: answered,
@@ -311,42 +495,16 @@ async fn collect_decisions(
     Ok(())
 }
 
-/// Streams one file and waits for the receiver's verdict on it.
-async fn send_one(session: &mut Session, need: &Needed) -> Result<(), PipelineError> {
-    let hash = stream_body(session, &need.source, need.file_id, need.from_offset).await?;
-
-    session
-        .control()
-        .send(&Control::FileDone {
-            file_id: need.file_id,
-            hash,
-        })
-        .await?;
-
-    match session.control().recv().await? {
-        Control::FileVerdict { ok: true, file_id } if file_id == need.file_id => Ok(()),
-        Control::FileVerdict { ok: false, .. } => Err(PipelineError::HashMismatch {
-            path: need.source.clone(),
-        }),
-        Control::FileVerdict { file_id, .. } => Err(PipelineError::UnknownFile { file_id }),
-        Control::Error { msg, .. } => Err(PipelineError::PeerFailed { msg }),
-        other => Err(PipelineError::UnexpectedMessage {
-            expected: "FileVerdict",
-            got: other.kind(),
-        }),
-    }
-}
-
-/// Streams the file body on its own unidirectional stream and returns its BLAKE3.
+/// Streams one file body on its own stream and returns its BLAKE3.
 ///
 /// The hash covers the whole file, including the prefix the receiver already has: both
 /// sides verify the same thing regardless of where the transfer resumed.
 async fn stream_body(
-    session: &Session,
-    source: &Path,
-    file_id: FileId,
-    from_offset: u64,
+    streams: &Streams,
+    need: &Needed,
+    pool: &BufferPool,
 ) -> Result<[u8; 32], PipelineError> {
+    let source = need.source.as_path();
     let mut file = File::open(source)
         .await
         .map_err(|error| PipelineError::Io {
@@ -359,9 +517,9 @@ async fn stream_body(
 
     // Everything before the resume point still has to be hashed, so read it even though
     // it is not sent. Storing hasher state in the journal (F5) is what removes this cost.
-    if from_offset > 0 {
-        hash_prefix(&mut file, source, &mut hasher, from_offset).await?;
-        file.seek(std::io::SeekFrom::Start(from_offset))
+    if need.from_offset > 0 {
+        hash_prefix(&mut file, source, &mut hasher, need.from_offset, pool).await?;
+        file.seek(std::io::SeekFrom::Start(need.from_offset))
             .await
             .map_err(|error| PipelineError::Io {
                 operation: "seeking",
@@ -370,21 +528,21 @@ async fn stream_body(
             })?;
     }
 
-    let mut stream = session.open_data_stream().await?;
+    let mut stream = streams.open().await?;
     write_data_header(
         &mut stream,
         &DataHeader {
-            file_id,
-            offset: from_offset,
+            file_id: need.file_id,
+            offset: need.from_offset,
             compressed: false,
         },
     )
     .await?;
 
-    let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+    let mut buffer = pool.acquire().await;
     loop {
         let read = file
-            .read(&mut buffer)
+            .read(buffer.bytes_mut())
             .await
             .map_err(|error| PipelineError::Io {
                 operation: "reading",
@@ -396,9 +554,9 @@ async fn stream_body(
             break;
         }
 
-        hasher.update(&buffer[..read]);
+        hasher.update(&buffer.bytes()[..read]);
         stream
-            .write_all(&buffer[..read])
+            .write_all(&buffer.bytes()[..read])
             .await
             .map_err(|error| PipelineError::Io {
                 operation: "sending",
@@ -423,16 +581,16 @@ async fn hash_prefix(
     source: &Path,
     hasher: &mut blake3::Hasher,
     length: u64,
+    pool: &BufferPool,
 ) -> Result<(), PipelineError> {
+    let mut buffer = pool.acquire().await;
+    let chunk = buffer.bytes().len();
     let mut remaining = length;
-    let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
 
     while remaining > 0 {
-        let want = usize::try_from(remaining)
-            .unwrap_or(READ_CHUNK_BYTES)
-            .min(READ_CHUNK_BYTES);
+        let want = usize::try_from(remaining).unwrap_or(chunk).min(chunk);
         let read = file
-            .read(&mut buffer[..want])
+            .read(&mut buffer.bytes_mut()[..want])
             .await
             .map_err(|error| PipelineError::Io {
                 operation: "reading",
@@ -444,7 +602,7 @@ async fn hash_prefix(
             break;
         }
 
-        hasher.update(&buffer[..read]);
+        hasher.update(&buffer.bytes()[..read]);
         remaining -= read as u64;
     }
 

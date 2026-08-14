@@ -5,6 +5,8 @@
 //! on disk is always a valid prefix of it.
 
 pub mod budget;
+pub mod bufpool;
+pub mod control;
 pub mod recv;
 pub mod send;
 

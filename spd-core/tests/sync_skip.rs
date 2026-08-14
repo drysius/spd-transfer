@@ -19,21 +19,14 @@ async fn transfer(source: &Path, destination: &Path, options: SendOptions) -> Se
     let destination = destination.to_path_buf();
 
     let receiving = tokio::spawn(async move {
-        let mut session = listener.accept().await.unwrap();
-        receive_tree(
-            &mut session,
-            &destination,
-            ReceiveOptions::default(),
-            &limits,
-        )
-        .await
-        .unwrap()
+        let session = listener.accept().await.unwrap();
+        receive_tree(session, &destination, ReceiveOptions::default(), &limits)
+            .await
+            .unwrap()
     });
 
-    let mut sender = dial(address, limits).await;
-    let report = send_tree(&mut sender, source, options, &limits)
-        .await
-        .unwrap();
+    let sender = dial(address, limits).await;
+    let report = send_tree(sender, source, options, &limits).await.unwrap();
 
     let received = receiving.await.unwrap();
     assert_eq!(

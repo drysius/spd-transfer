@@ -26,9 +26,9 @@ async fn a_file_arrives_byte_identical() {
     let destination_path = destination.path().to_path_buf();
 
     let receiving = tokio::spawn(async move {
-        let mut session = listener.accept().await.unwrap();
+        let session = listener.accept().await.unwrap();
         receive_tree(
-            &mut session,
+            session,
             &destination_path,
             ReceiveOptions::default(),
             &limits,
@@ -37,8 +37,8 @@ async fn a_file_arrives_byte_identical() {
         .unwrap()
     });
 
-    let mut sender = dial(address, limits).await;
-    let sent = send_tree(&mut sender, &file, SendOptions::default(), &limits)
+    let sender = dial(address, limits).await;
+    let sent = send_tree(sender, &file, SendOptions::default(), &limits)
         .await
         .unwrap();
     let received = receiving.await.unwrap();
@@ -66,9 +66,9 @@ async fn corrupted_bytes_are_detected_and_nothing_is_committed() {
     let destination_path = destination.path().to_path_buf();
 
     let receiving = tokio::spawn(async move {
-        let mut session = listener.accept().await.unwrap();
+        let session = listener.accept().await.unwrap();
         receive_tree(
-            &mut session,
+            session,
             &destination_path,
             ReceiveOptions::default(),
             &limits,
@@ -160,9 +160,9 @@ async fn a_traversing_path_is_refused_before_anything_is_written() {
     let destination_path = destination.path().to_path_buf();
 
     let receiving = tokio::spawn(async move {
-        let mut session = listener.accept().await.unwrap();
+        let session = listener.accept().await.unwrap();
         receive_tree(
-            &mut session,
+            session,
             &destination_path,
             ReceiveOptions::default(),
             &limits,

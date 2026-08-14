@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F3 (manifest and diff) done. F4 (parallelism) next.
+**Status:** F4 (parallelism) done. F5 (resume) next.
 **Last updated:** 2026-08-14
 
 ---
@@ -437,10 +437,17 @@ Shipped: parallel walk skipping `.spd`, persistent hash cache, batched manifest 
 `Transfer` announcement so the receiver knows what is coming, `--dry-run`, `--checksum`,
 `--follow-links`, and mode bits applied where the platform has them.
 
-### F4 - Parallelism
+### F4 - Parallelism - **done**
 Work queue, N streams, the four semaphores, bounded channels, buffer pool.
 **Done when:** a benchmark scales with `--streams`; peak RSS respects `--mem-budget` under
 load; no `unwrap` on the hot path.
+Shipped: split control stream (one writer task, one reader task routing replies per file),
+work queue with N workers, buffer pool sized by the budget, `disk_read`/`disk_write` job
+limits, `--streams`, `--mem-budget-mb`.
+Measured on 480 MiB across 60 files over loopback: 5.7 s with one stream, 2.4 s with four,
+flat after that (disk bound). Peak RSS 20 MiB at `--mem-budget-mb 8` and 67 MiB at 256.
+The `cpu` semaphore is not here: nothing runs on rayon yet. It arrives with zstd in F6,
+where there is finally CPU work to bound.
 
 ### F5 - Resume
 State actor, journal + snapshot, offset resume, reconnection with backoff.

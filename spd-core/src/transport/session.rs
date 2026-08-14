@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::time::timeout;
 
-use crate::proto::codec::ControlChannel;
+use crate::proto::codec::{ControlChannel, ControlReader, ControlWriter};
 use crate::proto::messages::{Control, DeviceId, ErrorCode};
 use crate::proto::version::{Features, Negotiated, PROTOCOL_VERSION, negotiate};
 use crate::safety::limits::Limits;
@@ -216,6 +216,25 @@ impl Session {
         self.close(reason);
     }
 
+    /// Takes the session apart so several tasks can work on it at once.
+    ///
+    /// A transfer with many files in flight needs three things happening independently:
+    /// workers opening streams, one task writing control messages, one task reading them.
+    /// Keeping them in a single object would mean a lock across the whole conversation.
+    pub fn split(self) -> SessionParts {
+        let (writer, reader) = self.control.split();
+
+        SessionParts {
+            streams: Streams {
+                connection: self.connection,
+            },
+            writer,
+            reader,
+            peer: self.peer,
+            limits: self.limits,
+        }
+    }
+
     fn assemble(
         connection: Connection,
         control: ControlChannel,
@@ -268,6 +287,73 @@ async fn linger_until_peer_leaves(
 /// `version` is a parameter rather than a constant so a test can announce a version this
 /// build does not speak and watch the peer reject it - the rejection path is the one that
 /// must never rot, and it cannot be exercised from outside otherwise.
+/// A session taken apart for a parallel transfer.
+pub struct SessionParts {
+    /// Opens and accepts data streams; cloneable, one clone per worker.
+    pub streams: Streams,
+    /// The control stream's sending half.
+    pub writer: ControlWriter,
+    /// The control stream's receiving half.
+    pub reader: ControlReader,
+    /// Who the session is with.
+    pub peer: PeerInfo,
+    /// The limits in force.
+    pub limits: Limits,
+}
+
+/// The stream-opening half of a session.
+///
+/// Cheap to clone - a QUIC connection is a handle - so every worker holds its own without
+/// coordinating with the others.
+#[derive(Debug, Clone)]
+pub struct Streams {
+    connection: Connection,
+}
+
+impl Streams {
+    /// Opens a unidirectional stream to send one file.
+    ///
+    /// # Errors
+    /// [`TransportError::Connection`] if the peer's stream limit is reached or the
+    /// connection is gone.
+    pub async fn open(&self) -> Result<SendStream, TransportError> {
+        self.connection
+            .open_uni()
+            .await
+            .map_err(|source| TransportError::Connection { source })
+    }
+
+    /// Waits for the peer to open the next data stream.
+    ///
+    /// # Errors
+    /// [`TransportError::Connection`] if the connection ends first.
+    pub async fn accept(&self) -> Result<RecvStream, TransportError> {
+        self.connection
+            .accept_uni()
+            .await
+            .map_err(|source| TransportError::Connection { source })
+    }
+
+    /// Waits for the peer to hang up, then closes.
+    ///
+    /// Same reasoning as [`Session::close_gracefully`]: the final message has to be read
+    /// before the connection disappears.
+    pub async fn close_gracefully(&self, reason: &str, linger: core::time::Duration) {
+        if timeout(linger, self.connection.closed()).await.is_err() {
+            tracing::debug!(
+                ?linger,
+                "the peer did not close in time; dropping the connection"
+            );
+        }
+        self.connection.close(0_u32.into(), reason.as_bytes());
+    }
+
+    /// Closes the connection immediately.
+    pub fn close(&self, reason: &str) {
+        self.connection.close(0_u32.into(), reason.as_bytes());
+    }
+}
+
 fn hello(device: DeviceId, version: u16) -> Control {
     Control::Hello {
         version,

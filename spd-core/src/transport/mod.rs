@@ -9,5 +9,5 @@ pub mod session;
 pub mod tls;
 
 pub use endpoint::{Listener, TransportError, connect, listen};
-pub use session::{PeerInfo, Session};
+pub use session::{PeerInfo, Session, SessionParts, Streams};
 pub use tls::{ALPN, TlsError, TrustPolicy};

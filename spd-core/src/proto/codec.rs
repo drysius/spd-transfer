@@ -6,6 +6,7 @@
 //! exact mistake that let the previous project allocate 128 MB pre-authentication.
 
 use bytes::Bytes;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use quinn::{RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Join, join};
@@ -52,19 +53,8 @@ impl ControlChannel {
     /// error arriving after the fact.
     /// [`ProtoError::Io`] if the stream is gone.
     pub async fn send(&mut self, message: &Control) -> Result<(), ProtoError> {
-        let encoded = postcard::to_stdvec(message).map_err(|source| ProtoError::Encode {
-            kind: message.kind(),
-            source,
-        })?;
-
-        if encoded.len() > self.max_frame_len_bytes {
-            return Err(ProtoError::FrameTooLarge {
-                got: encoded.len(),
-                max: self.max_frame_len_bytes,
-            });
-        }
-
-        self.framed.send(Bytes::from(encoded)).await?;
+        let encoded = encode(message, self.max_frame_len_bytes)?;
+        self.framed.send(encoded).await?;
         Ok(())
     }
 
@@ -91,6 +81,83 @@ impl ControlChannel {
         self.framed.close().await?;
         Ok(())
     }
+
+    /// Splits the channel into a writer and a reader that can live in different tasks.
+    ///
+    /// With many files in flight, replies arrive interleaved: a reader task routes each
+    /// one to whoever is waiting for that file, while workers keep writing. Sharing one
+    /// object behind a lock instead would serialise the whole conversation on whichever
+    /// worker is currently reading.
+    pub fn split(self) -> (ControlWriter, ControlReader) {
+        let (sink, stream) = self.framed.split();
+
+        (
+            ControlWriter {
+                sink,
+                max_frame_len_bytes: self.max_frame_len_bytes,
+            },
+            ControlReader { stream },
+        )
+    }
+}
+
+/// The sending half of a split control stream.
+pub struct ControlWriter {
+    sink: SplitSink<Framed<Join<RecvStream, SendStream>, LengthDelimitedCodec>, Bytes>,
+    max_frame_len_bytes: usize,
+}
+
+impl ControlWriter {
+    /// Sends one control message.
+    ///
+    /// # Errors
+    /// Same as [`ControlChannel::send`].
+    pub async fn send(&mut self, message: &Control) -> Result<(), ProtoError> {
+        let encoded = encode(message, self.max_frame_len_bytes)?;
+        self.sink.send(encoded).await?;
+        Ok(())
+    }
+
+    /// Flushes and closes the sending half.
+    ///
+    /// # Errors
+    /// [`ProtoError::Io`] if the flush fails.
+    pub async fn close(&mut self) -> Result<(), ProtoError> {
+        self.sink.close().await?;
+        Ok(())
+    }
+}
+
+/// The receiving half of a split control stream.
+pub struct ControlReader {
+    stream: SplitStream<Framed<Join<RecvStream, SendStream>, LengthDelimitedCodec>>,
+}
+
+impl ControlReader {
+    /// Receives the next control message.
+    ///
+    /// # Errors
+    /// Same as [`ControlChannel::recv`].
+    pub async fn recv(&mut self) -> Result<Control, ProtoError> {
+        let frame = self.stream.next().await.ok_or(ProtoError::PeerClosed)??;
+        postcard::from_bytes(&frame).map_err(|source| ProtoError::Decode { source })
+    }
+}
+
+fn encode(message: &Control, max_frame_len_bytes: usize) -> Result<Bytes, ProtoError> {
+    let encoded = postcard::to_stdvec(message).map_err(|source| ProtoError::Encode {
+        kind: message.kind(),
+        source,
+    })?;
+
+    if encoded.len() > max_frame_len_bytes {
+        return Err(ProtoError::FrameTooLarge {
+            got: encoded.len(),
+            max: max_frame_len_bytes,
+        });
+    }
+
+    Ok(Bytes::from(encoded))
 }
 
 /// Writes the header at the head of a data stream.

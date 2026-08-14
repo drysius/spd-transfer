@@ -84,6 +84,18 @@ pub(crate) struct SendArgs {
     /// you meant to send.
     #[arg(long)]
     pub(crate) follow_links: bool,
+
+    /// How much memory the transfer may hold, in MiB. Concurrency follows from this.
+    #[arg(long, default_value_t = 256, value_name = "MIB")]
+    pub(crate) mem_budget_mb: u64,
+
+    /// Upper bound on files in flight, one stream each. The memory budget can lower it.
+    #[arg(long, default_value_t = 16, value_name = "N")]
+    pub(crate) streams: u32,
+
+    /// Files read from disk at once. Raise it on an SSD, leave it low on a spinning disk.
+    #[arg(long, default_value_t = 4, value_name = "N")]
+    pub(crate) disk_read_jobs: u32,
 }
 
 /// Options for `spd recv`.
@@ -105,6 +117,18 @@ pub(crate) struct RecvArgs {
     /// Hash local files before deciding, instead of trusting size and timestamp.
     #[arg(long)]
     pub(crate) checksum: bool,
+
+    /// How much memory the transfer may hold, in MiB. Concurrency follows from this.
+    #[arg(long, default_value_t = 256, value_name = "MIB")]
+    pub(crate) mem_budget_mb: u64,
+
+    /// Upper bound on files in flight, one stream each. The memory budget can lower it.
+    #[arg(long, default_value_t = 16, value_name = "N")]
+    pub(crate) streams: u32,
+
+    /// Files written to disk at once. Raise it on an SSD, leave it low on a spinning disk.
+    #[arg(long, default_value_t = 4, value_name = "N")]
+    pub(crate) disk_write_jobs: u32,
 }
 
 fn default_listen_address() -> SocketAddr {

@@ -3,8 +3,8 @@
 Peer-to-peer file and folder transfer over QUIC. One connection, one stream per file,
 resume by byte offset, BLAKE3 verification end to end.
 
-**Status: early.** Phases F0-F3 are done: it syncs a folder, verified end to end, sending
-only what changed. Parallelism, resume and compression are still ahead. See [`PLAN.md`](PLAN.md).
+**Status: early.** Phases F0-F4 are done: it syncs a folder in parallel, verified end to end,
+sending only what changed. Resume and compression are still ahead. See [`PLAN.md`](PLAN.md).
 
 ## Build
 
