@@ -8,6 +8,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use spd_core::pipeline::budget::JobLimits;
 use spd_core::pipeline::retry::RetryPolicy;
 
 /// Peer-to-peer file and folder transfer over QUIC.
@@ -94,9 +95,19 @@ pub(crate) struct SendArgs {
     #[arg(long, default_value_t = 16, value_name = "N")]
     pub(crate) streams: u32,
 
+    /// Send every file as it is, without compressing anything. Worth it on a link fast
+    /// enough that the processor, not the network, is what you are short of.
+    #[arg(long)]
+    pub(crate) no_compress: bool,
+
     /// Files read from disk at once. Raise it on an SSD, leave it low on a spinning disk.
     #[arg(long, default_value_t = 4, value_name = "N")]
     pub(crate) disk_read_jobs: u32,
+
+    /// Buffers being compressed at once. Defaults to the number of cores; lower it to
+    /// leave the machine room for something else.
+    #[arg(long, default_value_t = default_cpu_jobs(), value_name = "N")]
+    pub(crate) cpu_jobs: u32,
 
     /// How many times to try, counting the first attempt. A dropped connection is picked
     /// up where it stopped; anything else fails immediately.
@@ -136,6 +147,11 @@ pub(crate) struct RecvArgs {
     #[arg(long, default_value_t = 4, value_name = "N")]
     pub(crate) disk_write_jobs: u32,
 
+    /// Buffers being decompressed at once. Defaults to the number of cores; lower it to
+    /// leave the machine room for something else.
+    #[arg(long, default_value_t = default_cpu_jobs(), value_name = "N")]
+    pub(crate) cpu_jobs: u32,
+
     /// How many sessions to accept before giving up, counting the first. A sender that
     /// reconnects finds the listener still waiting and continues where it stopped.
     #[arg(long, default_value_t = RetryPolicy::DEFAULT.attempts.get(), value_name = "N")]
@@ -144,6 +160,16 @@ pub(crate) struct RecvArgs {
 
 fn default_listen_address() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))
+}
+
+/// One codec job per core.
+///
+/// The core count is not a constant, so it cannot live in `JobLimits::DEFAULT`; this is
+/// where the program finds out what machine it is on.
+fn default_cpu_jobs() -> u32 {
+    std::thread::available_parallelism()
+        .map(|cores| u32::try_from(cores.get()).unwrap_or(u32::MAX))
+        .unwrap_or(JobLimits::DEFAULT.cpu_jobs.get())
 }
 
 /// Options for `spd doctor`.

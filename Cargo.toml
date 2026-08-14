@@ -26,6 +26,7 @@ quinn = { version = "0.11", default-features = false, features = [
     "rustls-ring",
     "log",
 ] }
+rayon = "1"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +35,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "ne
 tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# No `zstdmt`: threading belongs to the pipeline, which already knows how many files are
+# in flight. A second thread pool underneath it would compete with the first for cores.
+zstd = { version = "0.13", default-features = false }
 
 # Project rule: a warning is an error in CI (`-D warnings`). A new lint is configured
 # here, never as an `#[allow]` scattered through the code.

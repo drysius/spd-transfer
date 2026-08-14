@@ -24,6 +24,7 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
     let streams = NonZeroU32::new(args.streams).context("--streams must be at least 1")?;
     let disk_read_jobs =
         NonZeroU32::new(args.disk_read_jobs).context("--disk-read-jobs must be at least 1")?;
+    let cpu_jobs = NonZeroU32::new(args.cpu_jobs).context("--cpu-jobs must be at least 1")?;
 
     let limits = Limits {
         max_concurrent_streams: streams.get(),
@@ -34,10 +35,12 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
         follow_links: args.follow_links,
         checksum: args.checksum,
         dry_run: args.dry_run,
+        compress: !args.no_compress,
         mem_budget_bytes: args.mem_budget_mb.saturating_mul(1024 * 1024),
         jobs: JobLimits {
             streams,
             disk_read_jobs,
+            cpu_jobs,
             ..JobLimits::DEFAULT
         },
     };
@@ -75,6 +78,12 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
     ui::section("sent");
     ui::field("files", &report.transferred.files.to_string());
     ui::field("bytes", &ui::format_bytes(report.transferred.bytes));
+    if report.transferred.wire_bytes != report.transferred.bytes {
+        ui::field(
+            "on the wire",
+            &ui::format_bytes(report.transferred.wire_bytes),
+        );
+    }
     ui::field("skipped", &report.skipped.to_string());
 
     Ok(())

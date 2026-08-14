@@ -98,12 +98,23 @@ pub struct JobLimits {
     pub disk_read_jobs: NonZeroU32,
     /// Files being written to disk at once.
     pub disk_write_jobs: NonZeroU32,
+    /// Buffers being compressed or decompressed at once.
+    ///
+    /// Separate from the disk knobs because it competes for something else: the codec runs
+    /// on the CPU pool, and every core it takes is a core the network tasks do not have.
+    /// On a machine doing something else as well, this is the knob that gives it room.
+    pub cpu_jobs: NonZeroU32,
     /// Files in flight at once, one stream each.
     pub streams: NonZeroU32,
 }
 
 impl JobLimits {
-    /// Conservative defaults: four concurrent operations per disk, sixteen streams.
+    /// Conservative defaults: four concurrent operations per disk, four in the codec,
+    /// sixteen streams.
+    ///
+    /// Four rather than one core per core: this is a constant, and the number of cores is
+    /// not known until the program runs. `spd send` raises it to what the machine actually
+    /// has; a caller using this constant gets a floor that behaves the same everywhere.
     ///
     /// Written with `match` because `Option::unwrap_or` is not usable in a constant yet,
     /// and a constant is what keeps these defaults visible in one place.
@@ -113,6 +124,10 @@ impl JobLimits {
             None => NonZeroU32::MIN,
         },
         disk_write_jobs: match NonZeroU32::new(4) {
+            Some(value) => value,
+            None => NonZeroU32::MIN,
+        },
+        cpu_jobs: match NonZeroU32::new(4) {
             Some(value) => value,
             None => NonZeroU32::MIN,
         },
@@ -142,6 +157,8 @@ pub struct TransferPlan {
     pub disk_read_jobs: NonZeroU32,
     /// Files written to disk at once.
     pub disk_write_jobs: NonZeroU32,
+    /// Buffers in the codec at once.
+    pub cpu_jobs: NonZeroU32,
 }
 
 impl TransferPlan {
@@ -164,6 +181,7 @@ impl TransferPlan {
             buffers,
             disk_read_jobs: jobs.disk_read_jobs,
             disk_write_jobs: jobs.disk_write_jobs,
+            cpu_jobs: jobs.cpu_jobs,
         }
     }
 
@@ -267,6 +285,7 @@ mod plan_tests {
         let jobs = JobLimits {
             disk_read_jobs: NonZeroU32::new(2).unwrap(),
             disk_write_jobs: NonZeroU32::new(3).unwrap(),
+            cpu_jobs: NonZeroU32::new(5).unwrap(),
             streams: NonZeroU32::new(4).unwrap(),
         };
 
@@ -274,6 +293,7 @@ mod plan_tests {
 
         assert_eq!(plan.disk_read_jobs.get(), 2);
         assert_eq!(plan.disk_write_jobs.get(), 3);
+        assert_eq!(plan.cpu_jobs.get(), 5);
         assert_eq!(plan.workers.get(), 4);
     }
 }

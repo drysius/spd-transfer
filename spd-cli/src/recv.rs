@@ -27,6 +27,7 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
     let streams = NonZeroU32::new(args.streams).context("--streams must be at least 1")?;
     let disk_write_jobs =
         NonZeroU32::new(args.disk_write_jobs).context("--disk-write-jobs must be at least 1")?;
+    let cpu_jobs = NonZeroU32::new(args.cpu_jobs).context("--cpu-jobs must be at least 1")?;
 
     let limits = Limits {
         max_concurrent_streams: streams.get(),
@@ -39,6 +40,7 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
         jobs: JobLimits {
             streams,
             disk_write_jobs,
+            cpu_jobs,
             ..JobLimits::DEFAULT
         },
     };
@@ -68,6 +70,9 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
     ui::section("received");
     ui::field("files", &summary.files.to_string());
     ui::field("bytes", &ui::format_bytes(summary.bytes));
+    if summary.wire_bytes != summary.bytes {
+        ui::field("on the wire", &ui::format_bytes(summary.wire_bytes));
+    }
 
     Ok(())
 }

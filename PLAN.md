@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F5 (resume) done. F6 (compression) next.
+**Status:** F6 (compression) done. F7 (security) next.
 **Last updated:** 2026-08-14
 
 ---
@@ -478,10 +478,19 @@ And progress is not journalled per block - `metadata().len()` already knows how 
 `.part` file got, and a second answer to that question could only ever disagree with the
 first.
 
-### F6 - Compression
+### F6 - Compression - **done**
 zstd streaming, extension + sample decision, header flag.
 **Done when:** a text folder compresses; an mp4/zip folder passes through with no
 measurable CPU cost; the receiver honours the per-file flag.
+Shipped: `compress.rs` - the extension list, the sample, and thin streaming wrappers around
+zstd that turn bytes into bytes and nothing else; the codec running on rayon behind the
+`cpu` semaphore promised in F4, with `--cpu-jobs`; `--no-compress`; and `wire_bytes` on
+`TransferSummary`, which is what makes "did it compress" a number rather than an opinion.
+Measured: 248 files of source, 1.8 MiB, crossed as 663 KiB. A 57 MiB mp4 crossed whole in
+0.99 s, and the same bytes named `.dat` - so the sample runs rather than the extension
+list - in 0.90 s.
+The uncompressed path is unchanged and stays copy-free: a body crossing as it is gets
+hashed where it was read and written from there. Only compression adds a second buffer.
 
 ### F7 - Security
 Pairing, `--insecure` with a warning, all limits enforced, fuzzing for the decoder and

@@ -42,11 +42,12 @@ docs, error wording). Load them when writing or reviewing Rust.
 
 ## Phase status
 
-F0-F5 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport,
+F0-F6 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport,
 verified transfers (`SafeRelPath`, `.part` plus atomic rename), folder sync with a hash
-cache, parallel transfers (work queue, buffer pool, `--streams`, `--mem-budget-mb`) and
+cache, parallel transfers (work queue, buffer pool, `--streams`, `--mem-budget-mb`),
 resume (state actor over a journal in `.spd`, offset resume, reconnection with backoff,
-`--attempts`). F6 is compression - see `PLAN.md §10`.
+`--attempts`) and zstd compression decided per file (`--no-compress`, `--cpu-jobs`).
+F7 is security - see `PLAN.md §10`.
 
 Nothing lands for a future phase ahead of time; each phase ends with green CI and a usable
 binary.

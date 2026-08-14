@@ -17,6 +17,7 @@ getrandom.workspace = true
 jwalk.workspace = true
 postcard.workspace = true
 quinn.workspace = true
+rayon.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true
@@ -24,6 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

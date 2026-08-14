@@ -3,9 +3,10 @@
 Peer-to-peer file and folder transfer over QUIC. One connection, one stream per file,
 resume by byte offset, BLAKE3 verification end to end.
 
-**Status: early.** Phases F0-F5 are done: it syncs a folder in parallel, verified end to end,
-sending only what changed, and an interrupted transfer carries on where it stopped.
-Compression is still ahead. See [`PLAN.md`](PLAN.md).
+**Status: early.** Phases F0-F6 are done: it syncs a folder in parallel, verified end to end,
+sending only what changed, compressing what is worth compressing, and an interrupted
+transfer carries on where it stopped. Pairing is still ahead, so `--insecure` is currently
+the only way to run it. See [`PLAN.md`](PLAN.md).
 
 ## Build
 
@@ -30,6 +31,10 @@ spd send ./photos 192.168.1.20:9432 --insecure --dry-run   # what would move
 Pull the cable and both sides try again on their own, up to `--attempts` times: the files
 already there are skipped and the one that was in flight continues from the byte it reached.
 Run the same command again later and it does the same thing.
+
+Bodies are compressed when that is worth doing, decided per file: a folder of source or
+logs crosses at a fraction of its size, a folder of video is not even sampled. `--no-compress`
+turns it off for a link fast enough that the processor is the scarce thing.
 
 `--insecure` is required and not a default: it encrypts the traffic but does not prove who
 the other side is. Pairing arrives in F7, and until then the choice is explicit.

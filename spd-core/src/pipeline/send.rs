@@ -9,6 +9,10 @@
 //! manifest batches, one reply each, an announcement of what is coming, then the bodies.
 //! Bodies move in parallel; the control stream stays single-owner, with workers posting to
 //! it through an outbox.
+//!
+//! A body may cross compressed. That is decided per file, before its stream is opened, and
+//! announced in the stream's header - the receiver obeys the header and never its own
+//! configuration, because only this side knows what it actually did.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -19,9 +23,11 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
+use crate::compress::{self, CompressError, Encoder};
 use crate::pipeline::budget::{DEFAULT_MEM_BUDGET_BYTES, JobLimits, TransferPlan};
-use crate::pipeline::bufpool::BufferPool;
+use crate::pipeline::bufpool::{BufferPool, PooledBuffer};
 use crate::pipeline::control::{Outbox, spawn_outbox};
+use crate::pipeline::cpu::on_cpu;
 use crate::pipeline::prefix::hash_prefix;
 use crate::pipeline::{PipelineError, TransferSummary};
 use crate::proto::codec::{ControlReader, ControlWriter, write_data_header};
@@ -34,6 +40,11 @@ use crate::transport::session::{Session, Streams};
 
 /// How the sender should behave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these are the command-line switches; grouping them into enums would only put \
+              a layer between the flag a user typed and the behaviour it names"
+)]
 pub struct SendOptions {
     /// Follow symlinks while scanning.
     pub follow_links: bool,
@@ -45,6 +56,10 @@ pub struct SendOptions {
     /// Run the whole negotiation and report what would move, without opening a single data
     /// stream.
     pub dry_run: bool,
+
+    /// Compress a file when it looks worth compressing. Off means every body crosses as it
+    /// is, which is what a fast link and a busy processor want.
+    pub compress: bool,
 
     /// Memory the transfer may hold, in bytes. Concurrency follows from this.
     pub mem_budget_bytes: u64,
@@ -59,6 +74,7 @@ impl Default for SendOptions {
             follow_links: false,
             checksum: false,
             dry_run: false,
+            compress: true,
             mem_budget_bytes: DEFAULT_MEM_BUDGET_BYTES,
             jobs: JobLimits::DEFAULT,
         }
@@ -70,7 +86,9 @@ impl Default for SendOptions {
 pub struct SendReport {
     /// What actually crossed. Zero on a dry run.
     pub transferred: TransferSummary,
-    /// What the receiver asked for, whether or not it was sent.
+    /// What the receiver asked for, whether or not it was sent. Its `wire_bytes` is zero:
+    /// how much would cross depends on what compresses, and that is decided file by file
+    /// as each one is sent.
     pub planned: TransferSummary,
     /// Files the receiver already had.
     pub skipped: u64,
@@ -107,6 +125,9 @@ pub async fn send_tree(
             .iter()
             .map(|need| need.remaining)
             .fold(0, u64::saturating_add),
+        // Nothing has crossed yet, and how much will depends on what compresses, which is
+        // not known until each file is sampled.
+        wire_bytes: 0,
     };
     let skipped = manifest.len() as u64 - planned.files;
 
@@ -190,6 +211,7 @@ async fn run_workers(
 
     let pool = BufferPool::new(plan.buffers, plan.buffer_bytes);
     let disk_read = Arc::new(Semaphore::new(plan.disk_read_jobs.get() as usize));
+    let cpu_jobs = Arc::new(Semaphore::new(plan.cpu_jobs.get() as usize));
     let queue = Arc::new(Mutex::new(queue));
 
     let mut workers = JoinSet::new();
@@ -200,6 +222,8 @@ async fn run_workers(
             Arc::clone(&queue),
             pool.clone(),
             Arc::clone(&disk_read),
+            Arc::clone(&cpu_jobs),
+            options,
         ));
     }
 
@@ -211,6 +235,7 @@ async fn run_workers(
             Ok(Ok(summary)) => {
                 transferred.files += summary.files;
                 transferred.bytes = transferred.bytes.saturating_add(summary.bytes);
+                transferred.wire_bytes = transferred.wire_bytes.saturating_add(summary.wire_bytes);
             }
             // Keep the first failure and let the others finish: aborting mid-flight would
             // leave streams half written and the peer waiting on them.
@@ -253,6 +278,8 @@ async fn worker(
     queue: WorkQueue,
     pool: BufferPool,
     disk_read: Arc<Semaphore>,
+    cpu_jobs: Arc<Semaphore>,
+    options: SendOptions,
 ) -> Result<TransferSummary, PipelineError> {
     let mut summary = TransferSummary::default();
 
@@ -261,17 +288,18 @@ async fn worker(
             return Ok(summary);
         };
 
-        let hash = {
+        let sent = {
             // The permit is held only while the file is being read, so a worker waiting
             // for a verdict is not also holding a disk slot.
             let _permit = disk_read.acquire().await;
-            stream_body(&streams, &need, &pool).await?
+            let compressed = worth_compressing(&need, &pool, &cpu_jobs, options).await?;
+            stream_body(&streams, &need, &pool, &cpu_jobs, compressed).await?
         };
 
         outbox
             .send(Control::FileDone {
                 file_id: need.file_id,
-                hash,
+                hash: sent.hash,
             })
             .await?;
 
@@ -284,6 +312,68 @@ async fn worker(
 
         summary.files += 1;
         summary.bytes = summary.bytes.saturating_add(need.remaining);
+        summary.wire_bytes = summary.wire_bytes.saturating_add(sent.wire_bytes);
+    }
+}
+
+/// Decides whether this file's body should cross compressed.
+///
+/// Cheap evidence first, as everywhere else: an extension that already means "compressed"
+/// settles it without opening the file, which is what keeps a folder of video costing
+/// nothing. Anything else is decided by compressing a sample of it.
+///
+/// A sampled file is read twice - once here, once for the body - but only its first
+/// [`compress::SAMPLE_BYTES`], and the second read comes straight from the page cache.
+async fn worth_compressing(
+    need: &Needed,
+    pool: &BufferPool,
+    cpu_jobs: &Arc<Semaphore>,
+    options: SendOptions,
+) -> Result<bool, PipelineError> {
+    if !options.compress || compress::is_already_compressed(&need.source) {
+        return Ok(false);
+    }
+
+    let mut file = File::open(&need.source)
+        .await
+        .map_err(|source| PipelineError::Io {
+            operation: "opening",
+            path: need.source.clone(),
+            source,
+        })?;
+
+    let mut sample = pool.acquire().await;
+    let wanted = sample.bytes().len().min(compress::SAMPLE_BYTES);
+    let read = file
+        .read(&mut sample.bytes_mut()[..wanted])
+        .await
+        .map_err(|source| PipelineError::Io {
+            operation: "reading",
+            path: need.source.clone(),
+            source,
+        })?;
+
+    let scratch = pool.acquire().await;
+    let permit = Arc::clone(cpu_jobs).acquire_owned().await.map_err(closed)?;
+    let (_returned, verdict) = on_cpu(permit, move || {
+        let mut scratch = scratch;
+        let verdict = compress::worth_compressing(&sample.bytes()[..read], scratch.bytes_mut());
+        ((sample, scratch), verdict)
+    })
+    .await?;
+
+    let verdict = verdict?;
+    tracing::debug!(path = %need.source.display(), compress = verdict, "compression decided");
+
+    Ok(verdict)
+}
+
+/// A closed CPU semaphore means the transfer is already shutting down.
+fn closed(_closed: tokio::sync::AcquireError) -> PipelineError {
+    PipelineError::Io {
+        operation: "queueing CPU work for",
+        path: PathBuf::new(),
+        source: std::io::Error::other("the transfer is shutting down"),
     }
 }
 
@@ -507,15 +597,27 @@ async fn collect_decisions(
     Ok(())
 }
 
+/// What sending one body cost and proved.
+#[derive(Debug, Clone, Copy)]
+struct Sent {
+    /// BLAKE3 of the whole file, compression or not.
+    hash: [u8; 32],
+    /// Bytes actually written to the stream.
+    wire_bytes: u64,
+}
+
 /// Streams one file body on its own stream and returns its BLAKE3.
 ///
-/// The hash covers the whole file, including the prefix the receiver already has: both
-/// sides verify the same thing regardless of where the transfer resumed.
+/// The hash covers the whole file, uncompressed, including the prefix the receiver already
+/// has: both sides verify the same thing regardless of where the transfer resumed and of
+/// what crossed the wire.
 async fn stream_body(
     streams: &Streams,
     need: &Needed,
     pool: &BufferPool,
-) -> Result<[u8; 32], PipelineError> {
+    cpu_jobs: &Arc<Semaphore>,
+    compressed: bool,
+) -> Result<Sent, PipelineError> {
     let source = need.source.as_path();
     let mut file = File::open(source)
         .await
@@ -555,15 +657,17 @@ async fn stream_body(
         &DataHeader {
             file_id: need.file_id,
             offset: need.from_offset,
-            compressed: false,
+            compressed,
         },
     )
     .await?;
 
-    let mut buffer = pool.acquire().await;
+    let mut stage = Encoding::start(hasher, compressed, pool).await?;
+    let mut wire_bytes = 0_u64;
+
     loop {
         let read = file
-            .read(buffer.bytes_mut())
+            .read(stage.input_mut())
             .await
             .map_err(|error| PipelineError::Io {
                 operation: "reading",
@@ -575,15 +679,40 @@ async fn stream_body(
             break;
         }
 
-        hasher.update(&buffer.bytes()[..read]);
-        stream
-            .write_all(&buffer.bytes()[..read])
-            .await
-            .map_err(|error| PipelineError::Stream {
-                operation: "sending",
-                path: source.to_path_buf(),
-                source: error.into(),
-            })?;
+        stage.filled(read);
+
+        // One pass is enough for a body crossing as it is; a compressed one goes round
+        // until the codec has taken the whole chunk, because its output can need more room
+        // than one buffer has.
+        while !stage.drained() {
+            let permit = Arc::clone(cpu_jobs).acquire_owned().await.map_err(closed)?;
+            let (returned, stepped) = on_cpu(permit, move || {
+                let mut stage = stage;
+                let stepped = stage.step();
+                (stage, stepped)
+            })
+            .await?;
+
+            stage = returned;
+            stepped?;
+
+            wire_bytes += send(&mut stream, stage.ready(), source).await?;
+        }
+    }
+
+    while stage.unfinished() {
+        let permit = Arc::clone(cpu_jobs).acquire_owned().await.map_err(closed)?;
+        let (returned, tail) = on_cpu(permit, move || {
+            let mut stage = stage;
+            let tail = stage.tail();
+            (stage, tail)
+        })
+        .await?;
+
+        stage = returned;
+        tail?;
+
+        wire_bytes += send(&mut stream, stage.ready(), source).await?;
     }
 
     // Finishing the stream is how the receiver learns the file ended; without it, it waits
@@ -594,5 +723,160 @@ async fn stream_body(
         source: std::io::Error::other(error),
     })?;
 
-    Ok(*hasher.finalize().as_bytes())
+    Ok(Sent {
+        hash: stage.finish(),
+        wire_bytes,
+    })
+}
+
+/// Writes one block to the stream and says how many bytes that was.
+async fn send(
+    stream: &mut quinn::SendStream,
+    block: &[u8],
+    source: &Path,
+) -> Result<u64, PipelineError> {
+    if block.is_empty() {
+        return Ok(0);
+    }
+
+    stream
+        .write_all(block)
+        .await
+        .map_err(|error| PipelineError::Stream {
+            operation: "sending",
+            path: source.to_path_buf(),
+            source: error.into(),
+        })?;
+
+    Ok(block.len() as u64)
+}
+
+/// The CPU half of sending one file: hashing it, and compressing it when that is worth
+/// doing.
+///
+/// It owns its buffers so the whole thing can be handed to the CPU pool and taken back
+/// without borrowing anything across the hop. A body crossing as it is never leaves the
+/// input buffer: it is hashed where it was read and written from there, with no copy in
+/// between.
+struct Encoding {
+    hasher: blake3::Hasher,
+    encoder: Option<Encoder>,
+    input: PooledBuffer,
+    output: Option<PooledBuffer>,
+    /// Bytes of `input` holding file data.
+    filled: usize,
+    /// How much of that the codec has taken.
+    taken: usize,
+    /// Whether this chunk has been hashed yet - once per chunk, however many codec passes
+    /// it needs.
+    hashed: bool,
+    /// Bytes the last pass produced, in `output` when compressing and in `input` when not.
+    produced: usize,
+    /// Whether the compressed stream still has an ending to write.
+    ending: bool,
+}
+
+impl Encoding {
+    async fn start(
+        hasher: blake3::Hasher,
+        compressed: bool,
+        pool: &BufferPool,
+    ) -> Result<Self, PipelineError> {
+        let (encoder, output) = if compressed {
+            (Some(Encoder::new()?), Some(pool.acquire().await))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            hasher,
+            encoder,
+            input: pool.acquire().await,
+            output,
+            filled: 0,
+            taken: 0,
+            hashed: false,
+            produced: 0,
+            ending: compressed,
+        })
+    }
+
+    /// Where the next chunk is read into.
+    fn input_mut(&mut self) -> &mut [u8] {
+        self.input.bytes_mut()
+    }
+
+    /// Announces how much of the input buffer the disk filled.
+    fn filled(&mut self, read: usize) {
+        self.filled = read;
+        self.taken = 0;
+        self.hashed = false;
+        self.produced = 0;
+    }
+
+    /// Whether the current chunk has been fully taken by the codec.
+    fn drained(&self) -> bool {
+        self.taken >= self.filled
+    }
+
+    /// Whether the stream still has an ending to write.
+    fn unfinished(&self) -> bool {
+        self.ending
+    }
+
+    /// Hashes the chunk once, then compresses as much of it as fits in the output buffer.
+    ///
+    /// Runs on the CPU pool.
+    fn step(&mut self) -> Result<(), CompressError> {
+        if !self.hashed {
+            self.hasher.update(&self.input.bytes()[..self.filled]);
+            self.hashed = true;
+        }
+
+        let (Some(encoder), Some(output)) = (self.encoder.as_mut(), self.output.as_mut()) else {
+            // Crossing as it is: the chunk is already where it needs to be.
+            self.taken = self.filled;
+            self.produced = self.filled;
+            return Ok(());
+        };
+
+        let step = encoder.push(
+            &self.input.bytes()[self.taken..self.filled],
+            output.bytes_mut(),
+        )?;
+        self.taken += step.taken;
+        self.produced = step.produced;
+
+        Ok(())
+    }
+
+    /// Writes the next piece of the compressed stream's ending.
+    ///
+    /// Runs on the CPU pool.
+    fn tail(&mut self) -> Result<(), CompressError> {
+        let (Some(encoder), Some(output)) = (self.encoder.as_mut(), self.output.as_mut()) else {
+            self.ending = false;
+            self.produced = 0;
+            return Ok(());
+        };
+
+        let tail = encoder.finish(output.bytes_mut())?;
+        self.produced = tail.produced;
+        self.ending = tail.more;
+
+        Ok(())
+    }
+
+    /// What the last pass produced, ready to go on the wire.
+    fn ready(&self) -> &[u8] {
+        match self.output.as_ref() {
+            Some(output) => &output.bytes()[..self.produced],
+            None => &self.input.bytes()[..self.produced],
+        }
+    }
+
+    /// The hash of everything that went through.
+    fn finish(self) -> [u8; 32] {
+        *self.hasher.finalize().as_bytes()
+    }
 }

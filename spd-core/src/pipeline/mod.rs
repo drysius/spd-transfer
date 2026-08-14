@@ -7,6 +7,7 @@
 pub mod budget;
 pub mod bufpool;
 pub mod control;
+mod cpu;
 mod prefix;
 pub mod recv;
 pub mod retry;
@@ -25,8 +26,11 @@ use crate::transport::endpoint::TransportError;
 pub struct TransferSummary {
     /// Files actually transferred; skipped files are not counted.
     pub files: u64,
-    /// File bytes moved, before any framing.
+    /// File bytes moved, before any framing or compression.
     pub bytes: u64,
+    /// Bytes that actually crossed, after compression. Equal to `bytes` when nothing was
+    /// worth compressing, and the two together are the compression ratio.
+    pub wire_bytes: u64,
 }
 
 /// Why a transfer stopped.
@@ -130,6 +134,10 @@ pub enum PipelineError {
         /// Where the transfer expected to continue from.
         needed: u64,
     },
+
+    /// The codec failed, or the peer's compressed stream is malformed.
+    #[error(transparent)]
+    Compress(#[from] crate::compress::CompressError),
 
     /// A path was refused.
     #[error(transparent)]

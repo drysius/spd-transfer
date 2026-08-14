@@ -22,9 +22,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
+use crate::compress::{CompressError, Decoder};
 use crate::pipeline::budget::{DEFAULT_MEM_BUDGET_BYTES, JobLimits, TransferPlan};
-use crate::pipeline::bufpool::BufferPool;
+use crate::pipeline::bufpool::{BufferPool, PooledBuffer};
 use crate::pipeline::control::{Outbox, spawn_outbox};
+use crate::pipeline::cpu::on_cpu;
 use crate::pipeline::prefix::hash_prefix;
 use crate::pipeline::{PipelineError, TransferSummary};
 use crate::proto::codec::{ControlReader, ControlWriter, read_data_header};
@@ -191,6 +193,7 @@ async fn receive_bodies(
 
     let pool = BufferPool::new(plan.buffers, plan.buffer_bytes);
     let disk_write = Arc::new(Semaphore::new(plan.disk_write_jobs.get() as usize));
+    let cpu_jobs = Arc::new(Semaphore::new(plan.cpu_jobs.get() as usize));
     let wanted = Arc::new(wanted);
     let waiting = Arc::new(Mutex::new(waiting));
 
@@ -214,6 +217,7 @@ async fn receive_bodies(
             state.clone(),
             pool.clone(),
             Arc::clone(&disk_write),
+            Arc::clone(&cpu_jobs),
             *limits,
         ));
     }
@@ -234,7 +238,7 @@ async fn receive_bodies(
     Ok(summary)
 }
 
-type WorkerResult = Result<Result<u64, PipelineError>, tokio::task::JoinError>;
+type WorkerResult = Result<Result<Body, PipelineError>, tokio::task::JoinError>;
 
 /// Folds one finished worker into the running totals, keeping the first failure.
 fn collect(
@@ -243,9 +247,10 @@ fn collect(
     failure: &mut Option<PipelineError>,
 ) {
     match joined {
-        Some(Ok(Ok(bytes))) => {
+        Some(Ok(Ok(body))) => {
             summary.files += 1;
-            summary.bytes = summary.bytes.saturating_add(bytes);
+            summary.bytes = summary.bytes.saturating_add(body.bytes);
+            summary.wire_bytes = summary.wire_bytes.saturating_add(body.wire_bytes);
         }
         Some(Ok(Err(error))) => *failure = failure.take().or(Some(error)),
         Some(Err(joined)) => *failure = failure.take().or(Some(joined_error(joined))),
@@ -267,8 +272,9 @@ async fn worker(
     state: StateHandle,
     pool: BufferPool,
     disk_write: Arc<Semaphore>,
+    cpu_jobs: Arc<Semaphore>,
     limits: Limits,
-) -> Result<u64, PipelineError> {
+) -> Result<Body, PipelineError> {
     let header = read_data_header(&mut stream).await?;
 
     // A stream may only carry a file the receiver asked for. Anything else is a peer
@@ -300,7 +306,16 @@ async fn worker(
         // The permit is held only while the file is being written, so a worker waiting for
         // a hash is not also holding a disk slot.
         let _permit = disk_write.acquire().await;
-        write_body(stream, &partial, file.from_offset, &pool, &limits).await?
+        write_body(
+            stream,
+            &partial,
+            file.from_offset,
+            header.compressed,
+            &pool,
+            &cpu_jobs,
+            &limits,
+        )
+        .await?
     };
 
     let wait = waiting
@@ -342,11 +357,12 @@ async fn worker(
     tracing::info!(
         path = %file.relative,
         bytes = body.bytes,
+        wire_bytes = body.wire_bytes,
         resumed_from = file.from_offset,
         "file received"
     );
 
-    Ok(body.bytes)
+    Ok(body)
 }
 
 /// Reads the control stream, handing each hash to the worker waiting for that file.
@@ -520,9 +536,12 @@ async fn inspect(target: &Path, entry: &Entry, options: ReceiveOptions) -> Optio
 }
 
 /// What arrived on the data stream.
+#[derive(Debug, Clone, Copy)]
 struct Body {
-    /// Bytes written in this session; a resumed file wrote fewer than it is long.
+    /// File bytes written in this session; a resumed file wrote fewer than it is long.
     bytes: u64,
+    /// Bytes that actually arrived, before decompression.
+    wire_bytes: u64,
     /// BLAKE3 of the whole file, prefix included.
     hash: [u8; 32],
 }
@@ -532,11 +551,16 @@ struct Body {
 /// The hash covers the file from byte zero, so a resumed transfer reads the prefix already
 /// on disk before it writes anything: what both sides verify is the whole file, never just
 /// the piece that happened to cross this time.
+///
+/// `compressed` comes from the stream's own header, never from this side's configuration:
+/// the sender decided per file and only it knows what it did.
 async fn write_body(
     mut stream: RecvStream,
     partial: &Path,
     from_offset: u64,
+    compressed: bool,
     pool: &BufferPool,
+    cpu_jobs: &Arc<Semaphore>,
     limits: &Limits,
 ) -> Result<Body, PipelineError> {
     if let Some(parent) = partial.parent() {
@@ -562,15 +586,16 @@ async fn write_body(
         open_for_resume(partial, from_offset, &mut hasher, pool).await?
     };
 
-    let mut buffer = pool.acquire().await;
+    let mut stage = Decoding::start(hasher, compressed, pool).await?;
     let mut written = 0_u64;
+    let mut wire_bytes = 0_u64;
 
     loop {
         // `None` here is the end of the stream, which is the end of the file: the sender
         // finished it deliberately, so there is no length field to disagree with.
         let Some(read) =
             stream
-                .read(buffer.bytes_mut())
+                .read(stage.input_mut())
                 .await
                 .map_err(|source| PipelineError::Stream {
                     operation: "receiving",
@@ -581,24 +606,44 @@ async fn write_body(
             break;
         };
 
-        written += read as u64;
-        let total = from_offset.saturating_add(written);
-        if total > limits.max_file_size_bytes {
-            return Err(PipelineError::FileTooLarge {
-                path: partial.to_path_buf(),
-                size: total,
-                max: limits.max_file_size_bytes,
-            });
-        }
+        wire_bytes += read as u64;
+        stage.filled(read);
 
-        hasher.update(&buffer.bytes()[..read]);
-        file.write_all(&buffer.bytes()[..read])
-            .await
-            .map_err(|source| PipelineError::Io {
-                operation: "writing",
-                path: partial.to_path_buf(),
-                source,
-            })?;
+        // A compressed buffer can expand into several: each one is written before the next
+        // is produced, so a peer cannot make this side hold an arbitrary amount of memory
+        // by sending a small stream that unpacks into a large one.
+        while !stage.drained() {
+            let permit = Arc::clone(cpu_jobs).acquire_owned().await.map_err(closed)?;
+            let (returned, stepped) = on_cpu(permit, move || {
+                let mut stage = stage;
+                let stepped = stage.step();
+                (stage, stepped)
+            })
+            .await?;
+
+            stage = returned;
+            stepped?;
+
+            let block = stage.ready();
+            written += block.len() as u64;
+
+            let total = from_offset.saturating_add(written);
+            if total > limits.max_file_size_bytes {
+                return Err(PipelineError::FileTooLarge {
+                    path: partial.to_path_buf(),
+                    size: total,
+                    max: limits.max_file_size_bytes,
+                });
+            }
+
+            file.write_all(block)
+                .await
+                .map_err(|source| PipelineError::Io {
+                    operation: "writing",
+                    path: partial.to_path_buf(),
+                    source,
+                })?;
+        }
     }
 
     // Flush to the device before the rename: a rename that survives a crash while its
@@ -611,8 +656,117 @@ async fn write_body(
 
     Ok(Body {
         bytes: written,
-        hash: *hasher.finalize().as_bytes(),
+        wire_bytes,
+        hash: stage.finish(),
     })
+}
+
+/// A closed CPU semaphore means the transfer is already shutting down.
+fn closed(_closed: tokio::sync::AcquireError) -> PipelineError {
+    PipelineError::Io {
+        operation: "queueing CPU work for",
+        path: PathBuf::new(),
+        source: std::io::Error::other("the transfer is shutting down"),
+    }
+}
+
+/// The CPU half of receiving one file: decompressing it when the sender compressed it, and
+/// hashing what comes out.
+///
+/// Mirror of the sending side, and owns its buffers for the same reason: everything travels
+/// to the CPU pool by value, so nothing is borrowed across a hop that may be cancelled.
+/// A body that arrived as it is never leaves the input buffer.
+struct Decoding {
+    hasher: blake3::Hasher,
+    decoder: Option<Decoder>,
+    input: PooledBuffer,
+    output: Option<PooledBuffer>,
+    /// Bytes of `input` holding what arrived.
+    filled: usize,
+    /// How much of that the codec has taken.
+    taken: usize,
+    /// Bytes the last pass produced, in `output` when decompressing and in `input` when not.
+    produced: usize,
+}
+
+impl Decoding {
+    async fn start(
+        hasher: blake3::Hasher,
+        compressed: bool,
+        pool: &BufferPool,
+    ) -> Result<Self, PipelineError> {
+        let (decoder, output) = if compressed {
+            (Some(Decoder::new()?), Some(pool.acquire().await))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            hasher,
+            decoder,
+            input: pool.acquire().await,
+            output,
+            filled: 0,
+            taken: 0,
+            produced: 0,
+        })
+    }
+
+    /// Where the next arriving bytes are read into.
+    fn input_mut(&mut self) -> &mut [u8] {
+        self.input.bytes_mut()
+    }
+
+    /// Announces how much the stream delivered.
+    fn filled(&mut self, read: usize) {
+        self.filled = read;
+        self.taken = 0;
+        self.produced = 0;
+    }
+
+    /// Whether everything that arrived has been through the codec.
+    fn drained(&self) -> bool {
+        self.taken >= self.filled
+    }
+
+    /// Decompresses as much as fits in the output buffer, then hashes what came out.
+    ///
+    /// Hashing after decoding, never before: the hash is of the file, and the compressed
+    /// bytes are only how it travelled.
+    ///
+    /// Runs on the CPU pool.
+    fn step(&mut self) -> Result<(), CompressError> {
+        let (Some(decoder), Some(output)) = (self.decoder.as_mut(), self.output.as_mut()) else {
+            // Arrived as it is: what came in is what goes to disk.
+            self.taken = self.filled;
+            self.produced = self.filled;
+            self.hasher.update(&self.input.bytes()[..self.filled]);
+            return Ok(());
+        };
+
+        let step = decoder.pull(
+            &self.input.bytes()[self.taken..self.filled],
+            output.bytes_mut(),
+        )?;
+        self.taken += step.taken;
+        self.produced = step.produced;
+        self.hasher.update(&output.bytes()[..step.produced]);
+
+        Ok(())
+    }
+
+    /// What the last pass produced, ready for the disk.
+    fn ready(&self) -> &[u8] {
+        match self.output.as_ref() {
+            Some(output) => &output.bytes()[..self.produced],
+            None => &self.input.bytes()[..self.produced],
+        }
+    }
+
+    /// The hash of the whole file.
+    fn finish(self) -> [u8; 32] {
+        *self.hasher.finalize().as_bytes()
+    }
 }
 
 /// Opens a `.part` file to continue it, leaving the cursor exactly at `from_offset`.
