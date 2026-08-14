@@ -1,0 +1,17 @@
+[package]
+name = "spd-core"
+description = "spd peer-to-peer transfer core — protocol, transport, safety and pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Dependency rule (checked by CI): no UI crates here.
+# Forbidden: clap, indicatif, anyhow.
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

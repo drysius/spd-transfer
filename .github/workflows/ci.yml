@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # One definition of the pipeline: `cargo xtask ci`. Keeping the steps here as well
+  # would let the two drift, which is how a check quietly stops running.
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The core must stay free of user-interface dependencies. Enforced here because a
+  # convention that only lives in a document is one `cargo add` away from being false.
+  core-deps:
+    name: core dependency rule
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: spd-core must not depend on clap, indicatif or anyhow
+        run: |
+          tree=$(cargo tree --package spd-core --edges normal --prefix none --all-features)
+          for forbidden in clap indicatif anyhow; do
+            if echo "$tree" | grep -qE "^${forbidden} v"; then
+              echo "spd-core depends on ${forbidden}; the core carries no UI dependency"
+              exit 1
+            fi
+          done
