@@ -7,13 +7,17 @@
 //! Files arrive in parallel, so one file's hash can show up on the control stream while
 //! another is still being written. One task reads that stream and hands each hash to the
 //! worker waiting for it.
+//!
+//! A `.part` file that survives an interrupted run is not thrown away: the state actor
+//! remembers what it was started for, and if the sender offers that same file again the
+//! transfer picks up where it stopped.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use quinn::RecvStream;
-use tokio::fs::{self, File};
+use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
@@ -21,6 +25,7 @@ use tokio::task::JoinSet;
 use crate::pipeline::budget::{DEFAULT_MEM_BUDGET_BYTES, JobLimits, TransferPlan};
 use crate::pipeline::bufpool::BufferPool;
 use crate::pipeline::control::{Outbox, spawn_outbox};
+use crate::pipeline::prefix::hash_prefix;
 use crate::pipeline::{PipelineError, TransferSummary};
 use crate::proto::codec::{ControlReader, ControlWriter, read_data_header};
 use crate::proto::messages::{Control, Decision, Entry, FileId};
@@ -29,6 +34,8 @@ use crate::safety::path::SafeRelPath;
 use crate::scan::diff::{LocalFile, decide};
 use crate::scan::hash_cache::hash_file;
 use crate::scan::walk::mtime_of;
+use crate::state::model::{Expected, Partial};
+use crate::state::{StateHandle, spawn_state};
 use crate::transport::session::{Session, Streams};
 
 /// Suffix for a file that is still arriving. Visible on purpose: an interrupted transfer
@@ -74,12 +81,14 @@ pub async fn receive_tree(
     options: ReceiveOptions,
     limits: &Limits,
 ) -> Result<TransferSummary, PipelineError> {
+    let (state, state_task) = spawn_state(destination, limits).await?;
     let mut parts = session.split();
 
     let wanted = negotiate(
         &mut parts.writer,
         &mut parts.reader,
         destination,
+        &state,
         options,
         limits,
     )
@@ -112,6 +121,7 @@ pub async fn receive_tree(
         parts.reader,
         coming,
         wanted,
+        &state,
         options,
         limits,
     )
@@ -120,6 +130,11 @@ pub async fn receive_tree(
     // The receiver hangs up first: the sender only says `Done` once every verdict has
     // reached it, so nothing of ours is still in flight to be discarded by the close.
     streams.close("transfer complete");
+
+    // Dropping the last handle is what tells the state task to compact and finish; awaiting
+    // it is how a caller learns the record on disk is settled.
+    drop(state);
+    state_task.await.map_err(joined_error)??;
 
     Ok(summary)
 }
@@ -130,15 +145,26 @@ struct Wanted {
     relative: SafeRelPath,
     target: PathBuf,
     mode: u32,
+    /// Where the receiver asked the sender to start. Zero unless a `.part` file from an
+    /// interrupted run is being continued.
+    from_offset: u64,
+    /// What the file is expected to be, kept so the `.part` can be recognised next time.
+    expected: Expected,
 }
 
 /// Accepts the streams and writes them, several at a time.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each one is a distinct collaborator with a single owner; bundling them would \
+              only hide who holds what"
+)]
 async fn receive_bodies(
     streams: &Streams,
     writer: ControlWriter,
     reader: ControlReader,
     coming: u64,
     wanted: HashMap<FileId, Wanted>,
+    state: &StateHandle,
     options: ReceiveOptions,
     limits: &Limits,
 ) -> Result<TransferSummary, PipelineError> {
@@ -185,6 +211,7 @@ async fn receive_bodies(
             Arc::clone(&wanted),
             Arc::clone(&waiting),
             outbox.clone(),
+            state.clone(),
             pool.clone(),
             Arc::clone(&disk_write),
             *limits,
@@ -227,11 +254,17 @@ fn collect(
 }
 
 /// Receives one file: its stream, its hash, the verdict, and the rename that commits it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each one is a distinct collaborator with a single owner; bundling them would \
+              only hide who holds what"
+)]
 async fn worker(
     mut stream: RecvStream,
     wanted: Arc<HashMap<FileId, Wanted>>,
     waiting: Arc<Mutex<HashMap<FileId, oneshot::Receiver<[u8; 32]>>>>,
     outbox: Outbox,
+    state: StateHandle,
     pool: BufferPool,
     disk_write: Arc<Semaphore>,
     limits: Limits,
@@ -247,13 +280,27 @@ async fn worker(
             file_id: header.file_id,
         })?;
 
+    // Only this side decides where a file resumes. A stream starting anywhere else would
+    // leave a hole in the middle of the file that no hash could later explain.
+    if header.offset != file.from_offset {
+        return Err(PipelineError::ResumeOffset {
+            path: file.target.clone(),
+            got: header.offset,
+            agreed: file.from_offset,
+        });
+    }
+
     let partial = with_partial_suffix(&file.target);
+
+    // Recorded before the first byte lands: a `.part` file nobody can identify is a `.part`
+    // file that has to be thrown away.
+    state.started(file.relative.clone(), file.expected).await?;
 
     let body = {
         // The permit is held only while the file is being written, so a worker waiting for
         // a hash is not also holding a disk slot.
         let _permit = disk_write.acquire().await;
-        write_body(stream, &partial, &pool, &limits).await?
+        write_body(stream, &partial, file.from_offset, &pool, &limits).await?
     };
 
     let wait = waiting
@@ -283,14 +330,21 @@ async fn worker(
         if let Err(error) = fs::remove_file(&partial).await {
             tracing::warn!(path = %partial.display(), %error, "could not remove the partial file");
         }
+        state.forget(file.relative.clone()).await?;
         return Err(PipelineError::HashMismatch {
             path: file.target.clone(),
         });
     }
 
     commit(&partial, &file.target).await?;
+    state.forget(file.relative.clone()).await?;
     apply_mode(&file.target, file.mode).await;
-    tracing::info!(path = %file.relative, bytes = body.bytes, "file received");
+    tracing::info!(
+        path = %file.relative,
+        bytes = body.bytes,
+        resumed_from = file.from_offset,
+        "file received"
+    );
 
     Ok(body.bytes)
 }
@@ -328,6 +382,7 @@ async fn negotiate(
     writer: &mut ControlWriter,
     reader: &mut ControlReader,
     destination: &Path,
+    state: &StateHandle,
     options: ReceiveOptions,
     limits: &Limits,
 ) -> Result<HashMap<FileId, Wanted>, PipelineError> {
@@ -366,15 +421,18 @@ async fn negotiate(
             let target = relative.resolve_under(destination)?;
 
             let local = inspect(&target, &entry, options).await;
-            let decision = decide(&entry, local);
+            let partial = unfinished(&target, &relative, &entry, state).await?;
+            let decision = decide(&entry, local, partial);
 
-            if matches!(decision, Decision::Need { .. }) {
+            if let Decision::Need { from_offset, .. } = decision {
                 wanted.insert(
                     entry.file_id,
                     Wanted {
                         relative,
                         target,
                         mode: entry.mode,
+                        from_offset,
+                        expected: Expected::of(&entry),
                     },
                 );
             }
@@ -395,6 +453,43 @@ async fn negotiate(
     }
 
     Ok(wanted)
+}
+
+/// Looks for a `.part` file this transfer could continue.
+///
+/// The journal is asked first, and it is in memory: a tree with nothing left half-written -
+/// which is every tree that has never been interrupted - costs no filesystem calls at all.
+async fn unfinished(
+    target: &Path,
+    relative: &SafeRelPath,
+    entry: &Entry,
+    state: &StateHandle,
+) -> Result<Option<Partial>, PipelineError> {
+    let Some(expected) = state.partial(relative.clone()).await? else {
+        return Ok(None);
+    };
+
+    // The record says what the bytes were meant to become; only the filesystem knows how
+    // far they got, and a record whose `.part` file is gone means nothing.
+    let Ok(metadata) = fs::metadata(with_partial_suffix(target)).await else {
+        return Ok(None);
+    };
+
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    tracing::debug!(
+        path = %relative,
+        bytes_on_disk = metadata.len(),
+        still_offered = expected.still_matches(entry),
+        "found an unfinished file"
+    );
+
+    Ok(Some(Partial {
+        bytes_on_disk: metadata.len(),
+        expected,
+    }))
 }
 
 /// Looks at the local copy, hashing it only when a hash could actually change the answer.
@@ -426,13 +521,21 @@ async fn inspect(target: &Path, entry: &Entry, options: ReceiveOptions) -> Optio
 
 /// What arrived on the data stream.
 struct Body {
+    /// Bytes written in this session; a resumed file wrote fewer than it is long.
     bytes: u64,
+    /// BLAKE3 of the whole file, prefix included.
     hash: [u8; 32],
 }
 
+/// Writes the body into the `.part` file, continuing from `from_offset`.
+///
+/// The hash covers the file from byte zero, so a resumed transfer reads the prefix already
+/// on disk before it writes anything: what both sides verify is the whole file, never just
+/// the piece that happened to cross this time.
 async fn write_body(
     mut stream: RecvStream,
     partial: &Path,
+    from_offset: u64,
     pool: &BufferPool,
     limits: &Limits,
 ) -> Result<Body, PipelineError> {
@@ -446,17 +549,21 @@ async fn write_body(
             })?;
     }
 
-    let mut file = File::create(partial)
-        .await
-        .map_err(|source| PipelineError::Io {
-            operation: "creating",
-            path: partial.to_path_buf(),
-            source,
-        })?;
-
     let mut hasher = blake3::Hasher::new();
+    let mut file = if from_offset == 0 {
+        File::create(partial)
+            .await
+            .map_err(|source| PipelineError::Io {
+                operation: "creating",
+                path: partial.to_path_buf(),
+                source,
+            })?
+    } else {
+        open_for_resume(partial, from_offset, &mut hasher, pool).await?
+    };
+
     let mut buffer = pool.acquire().await;
-    let mut total = 0_u64;
+    let mut written = 0_u64;
 
     loop {
         // `None` here is the end of the stream, which is the end of the file: the sender
@@ -465,7 +572,7 @@ async fn write_body(
             stream
                 .read(buffer.bytes_mut())
                 .await
-                .map_err(|source| PipelineError::Io {
+                .map_err(|source| PipelineError::Stream {
                     operation: "receiving",
                     path: partial.to_path_buf(),
                     source: source.into(),
@@ -474,7 +581,8 @@ async fn write_body(
             break;
         };
 
-        total += read as u64;
+        written += read as u64;
+        let total = from_offset.saturating_add(written);
         if total > limits.max_file_size_bytes {
             return Err(PipelineError::FileTooLarge {
                 path: partial.to_path_buf(),
@@ -502,9 +610,52 @@ async fn write_body(
     })?;
 
     Ok(Body {
-        bytes: total,
+        bytes: written,
         hash: *hasher.finalize().as_bytes(),
     })
+}
+
+/// Opens a `.part` file to continue it, leaving the cursor exactly at `from_offset`.
+///
+/// Truncating first is what makes the offset a fact rather than a hope: whatever is beyond
+/// the agreed point was never accounted for by either side, and keeping it would put bytes
+/// after the ones about to arrive.
+async fn open_for_resume(
+    partial: &Path,
+    from_offset: u64,
+    hasher: &mut blake3::Hasher,
+    pool: &BufferPool,
+) -> Result<File, PipelineError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(partial)
+        .await
+        .map_err(|source| PipelineError::Io {
+            operation: "reopening",
+            path: partial.to_path_buf(),
+            source,
+        })?;
+
+    file.set_len(from_offset)
+        .await
+        .map_err(|source| PipelineError::Io {
+            operation: "trimming",
+            path: partial.to_path_buf(),
+            source,
+        })?;
+
+    let covered = hash_prefix(&mut file, partial, hasher, from_offset, pool).await?;
+    if covered != from_offset {
+        return Err(PipelineError::ResumeUnavailable {
+            path: partial.to_path_buf(),
+            ends_at: covered,
+            needed: from_offset,
+        });
+    }
+
+    // Reading the prefix left the cursor at its end, which is where the arriving bytes go.
+    Ok(file)
 }
 
 /// Publishes the verified file, replacing any previous version in one step.

@@ -3,7 +3,7 @@
 Peer-to-peer file and folder transfer, written from scratch in Rust.
 Reference document for this repository; self-contained.
 
-**Status:** F4 (parallelism) done. F5 (resume) next.
+**Status:** F5 (resume) done. F6 (compression) next.
 **Last updated:** 2026-08-14
 
 ---
@@ -321,16 +321,20 @@ out-of-root writing through another door.
 One task owns the state. Nobody else opens the file. Communication goes over a channel:
 
 ```rust
-enum StateMsg {
-    Recorded { file_id: u64, path: SafeRelPath, size: u64, mtime: u64, hash: [u8; 32] },
-    Progress { file_id: u64, bytes_on_disk: u64 },
-    Query    { path: SafeRelPath, reply: oneshot::Sender<Option<Record>> },
-    Flush    { reply: oneshot::Sender<()> },
+enum Request {
+    Partial { path: SafeRelPath, reply: oneshot::Sender<Option<Expected>> },
+    Started { path: SafeRelPath, expected: Expected, reply: oneshot::Sender<Result<()>> },
+    Forget  { path: SafeRelPath, reply: oneshot::Sender<Result<()>> },
 }
 ```
 
 This makes the previous project's race impossible by construction rather than by
 discipline.
+
+Keyed by path, not by `file_id`: a file id is assigned by the sender and means nothing in
+the next session, which is exactly the session the record exists for. And there is no
+progress message - `metadata().len()` already knows how far a `.part` file got, so a second
+answer to that question could only ever disagree with the first.
 
 ### Persistence
 
@@ -341,11 +345,16 @@ open: load the snapshot, replay the journal, compact.
 ### Offset resume
 
 1. The receiver knows `bytes_on_disk` for the `.part` file (confirmed with
-   `metadata().len()`, not just the journal).
+   `metadata().len()`, not just the journal) and, from the journal, what that file was
+   started for. A record that no longer matches the offer means the bytes are not a prefix
+   of anything being sent, and the transfer starts again at zero.
 2. Answering the manifest, it replies `Need { from_offset }`.
 3. The sender seeks to `offset` and opens the stream carrying that offset in the header.
-4. Both sides feed BLAKE3 in file order - the receiver rehashes the on-disk prefix before
-   continuing (or, better, stores hasher state in the journal when available).
+   A stream arriving at any other offset is refused: only the receiver decides where a file
+   resumes.
+4. Both sides feed BLAKE3 in file order, each re-reading the prefix it already has.
+   Storing hasher state instead was the plan; `blake3::Hasher` cannot be serialised, so
+   re-reading is what there is.
 
 Because the stream is ordered, what is on disk is always a valid prefix. No bitmap, no hole
 in the middle, no divergent arrival order.
@@ -449,10 +458,25 @@ flat after that (disk bound). Peak RSS 20 MiB at `--mem-budget-mb 8` and 67 MiB 
 The `cpu` semaphore is not here: nothing runs on rayon yet. It arrives with zstd in F6,
 where there is finally CPU work to bound.
 
-### F5 - Resume
+### F5 - Resume - **done**
 State actor, journal + snapshot, offset resume, reconnection with backoff.
 **Done when:** the fault harness kills the connection at 100 random points and the final
 tree is byte-identical all 100 times.
+Shipped: a state actor owning an append-only journal plus snapshot under `.spd`, written
+lazily so a run with nothing to record leaves the destination untouched; `Expected`, which
+is what lets a `.part` file be recognised as belonging to this same offer rather than to an
+older version of it; offset resume through `Decision::Need { from_offset }` with both sides
+hashing the prefix they already share; `RetryPolicy` with reconnection and backoff on both
+sides, and `--attempts`.
+The acceptance run is split in two: `tests/resume.rs` cuts a live connection mid-file and
+finishes the tree on the next run, then resumes the same file from a hundred different
+offsets in turn - deterministic rather than random, so a failure names the offset that
+broke instead of a seed.
+Two things the plan expected are deliberately not here. Hasher state is not stored in the
+journal: `blake3::Hasher` cannot be serialised, so both sides re-read the prefix instead.
+And progress is not journalled per block - `metadata().len()` already knows how far a
+`.part` file got, and a second answer to that question could only ever disagree with the
+first.
 
 ### F6 - Compression
 zstd streaming, extension + sample decision, header flag.

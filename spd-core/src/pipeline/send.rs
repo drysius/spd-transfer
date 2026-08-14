@@ -22,6 +22,7 @@ use tokio::task::JoinSet;
 use crate::pipeline::budget::{DEFAULT_MEM_BUDGET_BYTES, JobLimits, TransferPlan};
 use crate::pipeline::bufpool::BufferPool;
 use crate::pipeline::control::{Outbox, spawn_outbox};
+use crate::pipeline::prefix::hash_prefix;
 use crate::pipeline::{PipelineError, TransferSummary};
 use crate::proto::codec::{ControlReader, ControlWriter, write_data_header};
 use crate::proto::messages::{Control, DataHeader, Decision, FileId};
@@ -484,6 +485,17 @@ async fn collect_decisions(
             .find(file_id)
             .ok_or(PipelineError::UnknownFile { file_id })?;
 
+        // A resume point past the end of the file would mean the peer has bytes this file
+        // never had. Refuse before reading anything rather than send a body that cannot
+        // possibly hash to what was offered.
+        if from_offset > file.scanned.size {
+            return Err(PipelineError::ResumeUnavailable {
+                path: file.scanned.absolute.clone(),
+                ends_at: file.scanned.size,
+                needed: from_offset,
+            });
+        }
+
         needed.push(Needed {
             file_id,
             source: file.scanned.absolute.clone(),
@@ -515,10 +527,19 @@ async fn stream_body(
 
     let mut hasher = blake3::Hasher::new();
 
-    // Everything before the resume point still has to be hashed, so read it even though
-    // it is not sent. Storing hasher state in the journal (F5) is what removes this cost.
+    // Everything before the resume point still has to be hashed, so read it even though it
+    // is not sent: the hash both sides compare covers the whole file, not the part that
+    // happened to cross this time.
     if need.from_offset > 0 {
-        hash_prefix(&mut file, source, &mut hasher, need.from_offset, pool).await?;
+        let covered = hash_prefix(&mut file, source, &mut hasher, need.from_offset, pool).await?;
+        if covered != need.from_offset {
+            return Err(PipelineError::ResumeUnavailable {
+                path: source.to_path_buf(),
+                ends_at: covered,
+                needed: need.from_offset,
+            });
+        }
+
         file.seek(std::io::SeekFrom::Start(need.from_offset))
             .await
             .map_err(|error| PipelineError::Io {
@@ -558,7 +579,7 @@ async fn stream_body(
         stream
             .write_all(&buffer.bytes()[..read])
             .await
-            .map_err(|error| PipelineError::Io {
+            .map_err(|error| PipelineError::Stream {
                 operation: "sending",
                 path: source.to_path_buf(),
                 source: error.into(),
@@ -567,44 +588,11 @@ async fn stream_body(
 
     // Finishing the stream is how the receiver learns the file ended; without it, it waits
     // for bytes that are never coming.
-    stream.finish().map_err(|error| PipelineError::Io {
+    stream.finish().map_err(|error| PipelineError::Stream {
         operation: "closing the stream for",
         path: source.to_path_buf(),
         source: std::io::Error::other(error),
     })?;
 
     Ok(*hasher.finalize().as_bytes())
-}
-
-async fn hash_prefix(
-    file: &mut File,
-    source: &Path,
-    hasher: &mut blake3::Hasher,
-    length: u64,
-    pool: &BufferPool,
-) -> Result<(), PipelineError> {
-    let mut buffer = pool.acquire().await;
-    let chunk = buffer.bytes().len();
-    let mut remaining = length;
-
-    while remaining > 0 {
-        let want = usize::try_from(remaining).unwrap_or(chunk).min(chunk);
-        let read = file
-            .read(&mut buffer.bytes_mut()[..want])
-            .await
-            .map_err(|error| PipelineError::Io {
-                operation: "reading",
-                path: source.to_path_buf(),
-                source: error,
-            })?;
-
-        if read == 0 {
-            break;
-        }
-
-        hasher.update(&buffer.bytes()[..read]);
-        remaining -= read as u64;
-    }
-
-    Ok(())
 }

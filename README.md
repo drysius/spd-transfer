@@ -3,8 +3,9 @@
 Peer-to-peer file and folder transfer over QUIC. One connection, one stream per file,
 resume by byte offset, BLAKE3 verification end to end.
 
-**Status: early.** Phases F0-F4 are done: it syncs a folder in parallel, verified end to end,
-sending only what changed. Resume and compression are still ahead. See [`PLAN.md`](PLAN.md).
+**Status: early.** Phases F0-F5 are done: it syncs a folder in parallel, verified end to end,
+sending only what changed, and an interrupted transfer carries on where it stopped.
+Compression is still ahead. See [`PLAN.md`](PLAN.md).
 
 ## Build
 
@@ -25,6 +26,10 @@ spd recv --out ./inbox --listen 0.0.0.0:9432 --insecure
 spd send ./holiday.mp4 192.168.1.20:9432 --insecure
 spd send ./photos 192.168.1.20:9432 --insecure --dry-run   # what would move
 ```
+
+Pull the cable and both sides try again on their own, up to `--attempts` times: the files
+already there are skipped and the one that was in flight continues from the byte it reached.
+Run the same command again later and it does the same thing.
 
 `--insecure` is required and not a default: it encrypts the traffic but does not prove who
 the other side is. Pairing arrives in F7, and until then the choice is explicit.

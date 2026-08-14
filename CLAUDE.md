@@ -42,10 +42,11 @@ docs, error wording). Load them when writing or reviewing Rust.
 
 ## Phase status
 
-F0-F4 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport,
-verified transfers (`SafeRelPath`, `.part` plus atomic rename) and folder sync with a hash
-cache, and parallel transfers (work queue, buffer pool, `--streams`, `--mem-budget-mb`).
-F5 is resume - see `PLAN.md §10`.
+F0-F5 are done: limits, negotiation, memory budget, CI, `xtask`, the QUIC transport,
+verified transfers (`SafeRelPath`, `.part` plus atomic rename), folder sync with a hash
+cache, parallel transfers (work queue, buffer pool, `--streams`, `--mem-budget-mb`) and
+resume (state actor over a journal in `.spd`, offset resume, reconnection with backoff,
+`--attempts`). F6 is compression - see `PLAN.md §10`.
 
 Nothing lands for a future phase ahead of time; each phase ends with green CI and a usable
 binary.

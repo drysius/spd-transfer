@@ -8,6 +8,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use spd_core::pipeline::retry::RetryPolicy;
 
 /// Peer-to-peer file and folder transfer over QUIC.
 #[derive(Debug, Parser)]
@@ -96,6 +97,11 @@ pub(crate) struct SendArgs {
     /// Files read from disk at once. Raise it on an SSD, leave it low on a spinning disk.
     #[arg(long, default_value_t = 4, value_name = "N")]
     pub(crate) disk_read_jobs: u32,
+
+    /// How many times to try, counting the first attempt. A dropped connection is picked
+    /// up where it stopped; anything else fails immediately.
+    #[arg(long, default_value_t = RetryPolicy::DEFAULT.attempts.get(), value_name = "N")]
+    pub(crate) attempts: u32,
 }
 
 /// Options for `spd recv`.
@@ -129,6 +135,11 @@ pub(crate) struct RecvArgs {
     /// Files written to disk at once. Raise it on an SSD, leave it low on a spinning disk.
     #[arg(long, default_value_t = 4, value_name = "N")]
     pub(crate) disk_write_jobs: u32,
+
+    /// How many sessions to accept before giving up, counting the first. A sender that
+    /// reconnects finds the listener still waiting and continues where it stopped.
+    #[arg(long, default_value_t = RetryPolicy::DEFAULT.attempts.get(), value_name = "N")]
+    pub(crate) attempts: u32,
 }
 
 fn default_listen_address() -> SocketAddr {

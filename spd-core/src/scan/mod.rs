@@ -1,6 +1,6 @@
 //! Finding out what exists locally, and deciding what needs to move.
 //!
-//! [`walk`] lists a tree, [`hash_cache`] remembers hashes so a second send does not rehash
+//! [`mod@walk`] lists a tree, [`hash_cache`] remembers hashes so a second send does not rehash
 //! everything, [`manifest`] turns the listing into batches for the wire, and [`diff`] is
 //! the receiver deciding, entry by entry, what it actually needs.
 

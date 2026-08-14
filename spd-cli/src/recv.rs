@@ -4,7 +4,8 @@ use std::num::NonZeroU32;
 
 use anyhow::{Context, Result};
 use spd_core::pipeline::budget::JobLimits;
-use spd_core::pipeline::recv::{ReceiveOptions, receive_tree};
+use spd_core::pipeline::recv::ReceiveOptions;
+use spd_core::pipeline::retry::{RetryPolicy, receive_tree_resuming};
 use spd_core::proto::messages::DeviceId;
 use spd_core::safety::limits::Limits;
 use spd_core::transport::listen;
@@ -55,16 +56,12 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
     ui::field("device", &device.to_string());
     ui::field("destination", &destination.display().to_string());
 
-    let session = listener
-        .accept()
-        .await
-        .context("no peer completed a session")?;
+    let retry = RetryPolicy {
+        attempts: NonZeroU32::new(args.attempts).context("--attempts must be at least 1")?,
+        ..RetryPolicy::DEFAULT
+    };
 
-    ui::section("connected");
-    ui::field("peer", &session.peer().device.to_string());
-    ui::field("address", &session.peer().address.to_string());
-
-    let summary = receive_tree(session, &destination, options, &limits)
+    let summary = receive_tree_resuming(&listener, &destination, options, &limits, retry)
         .await
         .context("the transfer failed")?;
 

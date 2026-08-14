@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::scan::walk::ScannedFile;
-
-/// Directory holding spd's own state inside a transfer root.
-pub const STATE_DIR: &str = ".spd";
+use crate::state::STATE_DIR;
 
 /// File the cache is written to, inside [`STATE_DIR`].
 pub const CACHE_FILE: &str = "hashcache";

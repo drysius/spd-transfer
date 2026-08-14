@@ -4,10 +4,10 @@ use std::num::NonZeroU32;
 
 use anyhow::{Context, Result};
 use spd_core::pipeline::budget::JobLimits;
-use spd_core::pipeline::send::{SendOptions, send_tree};
+use spd_core::pipeline::retry::{RetryPolicy, send_tree_reconnecting};
+use spd_core::pipeline::send::SendOptions;
 use spd_core::proto::messages::DeviceId;
 use spd_core::safety::limits::Limits;
-use spd_core::transport::connect;
 
 use crate::args::SendArgs;
 use crate::{trust, ui};
@@ -42,17 +42,27 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
         },
     };
 
-    let session = connect(args.address, device, policy, limits)
-        .await
-        .with_context(|| format!("could not reach a receiver at {}", args.address))?;
+    let retry = RetryPolicy {
+        attempts: NonZeroU32::new(args.attempts).context("--attempts must be at least 1")?,
+        ..RetryPolicy::DEFAULT
+    };
 
-    ui::section("connected");
-    ui::field("peer", &session.peer().device.to_string());
-    ui::field("address", &session.peer().address.to_string());
+    ui::section("sending");
+    ui::field("to", &args.address.to_string());
+    ui::field("device", &device.to_string());
+    ui::field("path", &args.file.display().to_string());
 
-    let report = send_tree(session, &args.file, options, &limits)
-        .await
-        .with_context(|| format!("could not send {}", args.file.display()))?;
+    let report = send_tree_reconnecting(
+        args.address,
+        device,
+        policy,
+        &args.file,
+        options,
+        &limits,
+        retry,
+    )
+    .await
+    .with_context(|| format!("could not send {}", args.file.display()))?;
 
     if args.dry_run {
         ui::section("dry run");

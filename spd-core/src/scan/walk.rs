@@ -108,7 +108,7 @@ fn is_state_path(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root)
         .unwrap_or(path)
         .components()
-        .any(|component| component.as_os_str() == crate::scan::hash_cache::STATE_DIR)
+        .any(|component| component.as_os_str() == crate::state::STATE_DIR)
 }
 
 fn describe(
