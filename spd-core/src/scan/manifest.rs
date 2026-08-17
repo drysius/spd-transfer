@@ -31,6 +31,7 @@ impl Manifest {
     /// Numbers a listing, keeping the order the walk produced.
     ///
     /// Ids are positional, so they are stable within a session and meaningless outside it.
+    /// [`Self::find`] relies on exactly that: the id is the index into this vector.
     pub fn from_scan(scanned: Vec<ScannedFile>) -> Self {
         let files = scanned
             .into_iter()
@@ -74,8 +75,17 @@ impl Manifest {
     }
 
     /// Looks a file up by the id it was given.
+    ///
+    /// Indexed, not searched. [`Self::from_scan`] numbers files by position, so the id *is*
+    /// the index; the equality check afterwards is what keeps that an assertion rather than
+    /// an assumption, and what refuses an id a peer invented.
+    ///
+    /// It has to be O(1): the receiver answers with one decision per file, and looking each
+    /// one up by walking the list made a tree of two million files quadratic - the sending
+    /// side spent longer matching answers to files than it did reading the tree.
     pub fn find(&self, id: FileId) -> Option<&ManifestFile> {
-        self.files.iter().find(|file| file.id == id)
+        let index = usize::try_from(id.0).ok()?;
+        self.files.get(index).filter(|file| file.id == id)
     }
 }
 
@@ -147,6 +157,18 @@ mod tests {
         assert_eq!(manifest.files()[1].id, FileId(1));
         assert_eq!(manifest.find(FileId(1)).unwrap().scanned.size, 1);
         assert_eq!(manifest.total_bytes(), 11);
+    }
+
+    /// An id from a peer is an index into this side's list, so every value it could send has
+    /// to land somewhere safe: past the end, or wider than a `usize`, is not a file.
+    #[test]
+    fn an_id_that_was_never_offered_finds_nothing() {
+        let manifest = Manifest::from_scan(vec![scanned("only", 1)]);
+
+        assert_eq!(manifest.find(FileId(0)).unwrap().scanned.size, 1);
+        assert!(manifest.find(FileId(1)).is_none());
+        assert!(manifest.find(FileId(u64::MAX)).is_none());
+        assert!(Manifest::default().find(FileId(0)).is_none());
     }
 
     #[test]
