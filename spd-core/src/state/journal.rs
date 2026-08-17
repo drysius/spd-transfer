@@ -93,6 +93,8 @@ pub(crate) struct Journal {
     appender: Option<File>,
     live: HashMap<SafeRelPath, Expected>,
     unfolded: bool,
+    /// Whether anything has been appended since the last [`Self::commit`].
+    uncommitted: bool,
 }
 
 impl Journal {
@@ -122,6 +124,7 @@ impl Journal {
             // Records left by an interrupted run belong in the snapshot; folding them in is
             // what stops the journal growing across runs.
             unfolded: replayed > 0,
+            uncommitted: false,
         }
     }
 
@@ -132,14 +135,16 @@ impl Journal {
 
     /// Records that a `.part` file is being written for this offer.
     ///
-    /// Flushed to the device before returning: this is the record that makes the bytes
-    /// about to be written reusable, and a record that survives only in a cache is worth
-    /// nothing after the crash it exists for.
+    /// Written, not yet on the device. This record is what makes the bytes about to be
+    /// written reusable, and a record that survives only in a cache is worth nothing after
+    /// the crash it exists for - so nobody may be told the file is safe to write until
+    /// [`Self::commit`] returns. The task owning this journal is what holds those two
+    /// together, and it is the only caller.
     ///
     /// # Errors
     /// [`JournalError::Io`] if the journal cannot be appended to, [`JournalError::Encode`]
     /// if the record cannot be serialised.
-    pub(crate) fn started(
+    pub(crate) fn record_started(
         &mut self,
         path: SafeRelPath,
         expected: Expected,
@@ -149,6 +154,26 @@ impl Journal {
             expected,
         })?;
 
+        self.uncommitted = true;
+        self.live.insert(path, expected);
+        Ok(())
+    }
+
+    /// Puts every record appended since the last call on the device.
+    ///
+    /// One flush covers every record before it, which is the whole point: a receiver
+    /// writing thousands of small files asks to start thousands of times, and flushing each
+    /// one separately made the journal - a file nobody is waiting to read - the slowest part
+    /// of the transfer. Flushing them together costs one device round trip for all of them
+    /// and promises each caller exactly what it promised before.
+    ///
+    /// # Errors
+    /// [`JournalError::Io`] if the journal cannot be flushed.
+    pub(crate) fn commit(&mut self) -> Result<(), JournalError> {
+        if !self.uncommitted {
+            return Ok(());
+        }
+
         if let Some(appender) = self.appender.as_ref() {
             appender.sync_all().map_err(|source| JournalError::Io {
                 operation: "flushing the journal",
@@ -157,7 +182,7 @@ impl Journal {
             })?;
         }
 
-        self.live.insert(path, expected);
+        self.uncommitted = false;
         Ok(())
     }
 
@@ -167,7 +192,7 @@ impl Journal {
     /// and the next run finds no `.part` to go with it and starts from zero.
     ///
     /// # Errors
-    /// Same as [`Self::started`].
+    /// Same as [`Self::record_started`].
     pub(crate) fn forget(&mut self, path: &SafeRelPath) -> Result<(), JournalError> {
         if self.live.remove(path).is_none() {
             return Ok(());
@@ -447,11 +472,43 @@ mod tests {
         let limits = Limits::DEFAULT;
 
         let mut journal = Journal::open(&scratch.0, &limits);
-        journal.started(path("big.bin"), expected(100)).unwrap();
+        journal
+            .record_started(path("big.bin"), expected(100))
+            .unwrap();
         drop(journal);
 
         let reopened = Journal::open(&scratch.0, &limits);
         assert_eq!(reopened.partial(&path("big.bin")), Some(expected(100)));
+    }
+
+    /// A commit covers everything appended before it, and a second one with nothing new to
+    /// say costs nothing - which is what lets the owning task flush once per group of
+    /// callers instead of once per caller.
+    #[test]
+    fn one_commit_covers_every_record_before_it() {
+        let scratch = Scratch::new("group-commit");
+        let limits = Limits::DEFAULT;
+
+        let mut journal = Journal::open(&scratch.0, &limits);
+        for index in 0..8 {
+            journal
+                .record_started(path(&format!("file-{index}.bin")), expected(index))
+                .unwrap();
+        }
+        journal.commit().unwrap();
+        assert!(!journal.uncommitted);
+
+        journal.commit().unwrap();
+        drop(journal);
+
+        let reopened = Journal::open(&scratch.0, &limits);
+        for index in 0..8 {
+            assert_eq!(
+                reopened.partial(&path(&format!("file-{index}.bin"))),
+                Some(expected(index)),
+                "every record in the group has to survive the one flush that covered it"
+            );
+        }
     }
 
     #[test]
@@ -460,7 +517,9 @@ mod tests {
         let limits = Limits::DEFAULT;
 
         let mut journal = Journal::open(&scratch.0, &limits);
-        journal.started(path("gone.bin"), expected(10)).unwrap();
+        journal
+            .record_started(path("gone.bin"), expected(10))
+            .unwrap();
         journal.forget(&path("gone.bin")).unwrap();
         drop(journal);
 
@@ -474,7 +533,9 @@ mod tests {
         let limits = Limits::DEFAULT;
 
         let mut journal = Journal::open(&scratch.0, &limits);
-        journal.started(path("kept.bin"), expected(7)).unwrap();
+        journal
+            .record_started(path("kept.bin"), expected(7))
+            .unwrap();
         journal.compact().unwrap();
 
         let on_disk = scratch.0.join(STATE_DIR).join(JOURNAL_FILE);
@@ -488,8 +549,12 @@ mod tests {
         let limits = Limits::DEFAULT;
 
         let mut journal = Journal::open(&scratch.0, &limits);
-        journal.started(path("first.bin"), expected(1)).unwrap();
-        journal.started(path("second.bin"), expected(2)).unwrap();
+        journal
+            .record_started(path("first.bin"), expected(1))
+            .unwrap();
+        journal
+            .record_started(path("second.bin"), expected(2))
+            .unwrap();
         drop(journal);
 
         // Chop the tail off, the way a machine losing power mid-append would.

@@ -11,7 +11,7 @@
 pub mod journal;
 pub mod model;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -26,9 +26,12 @@ pub const STATE_DIR: &str = ".spd";
 
 /// How many requests may queue before a caller waits.
 ///
-/// Small on purpose: each one is a short file operation, and a worker waiting here is a
-/// worker that has stopped asking for more, which is the backpressure we want.
-const REQUEST_QUEUE_DEPTH: usize = 32;
+/// Deep enough that every worker of a wide transfer can be waiting at once, because what is
+/// queued when the flush comes round is exactly what that flush covers: a queue that fills
+/// early splits one device round trip into two. It is not a memory concern - a request is a
+/// path and a few numbers - and the backpressure that matters is still there, since a worker
+/// waiting for its record is a worker that has stopped asking for bytes.
+const REQUEST_QUEUE_DEPTH: usize = 256;
 
 /// A question or an instruction for the task owning the state.
 enum Request {
@@ -139,28 +142,71 @@ impl StateHandle {
 }
 
 /// Answers requests until every handle is gone, then settles the state on disk.
+///
+/// Requests are taken in groups: everything already queued is recorded, then flushed once,
+/// then answered. Waiting for the flush is what a caller asked for, and the flush is the
+/// expensive part - one device round trip whether it covers one record or sixty-four. Doing
+/// it per request made this task the ceiling on the whole transfer: sixty-four workers, all
+/// of them waiting behind a single file being flushed a few hundred times a second.
+///
+/// Nobody is answered early. A reply is sent after the flush that covers its record, which
+/// is exactly what it meant before.
 fn serve(mut journal: Journal, mut requests: mpsc::Receiver<Request>) -> Result<(), JournalError> {
-    while let Some(request) = requests.blocking_recv() {
-        match request {
-            Request::Partial { path, reply } => {
-                // A caller that gave up before the answer arrived is not an error: the
-                // transfer it belonged to already failed for its own reason.
-                let _ = reply.send(journal.partial(&path));
+    let mut group = Vec::with_capacity(REQUEST_QUEUE_DEPTH);
+
+    while let Some(first) = requests.blocking_recv() {
+        group.push(first);
+        // Whatever else is already waiting joins this flush. Nothing is waited *for*: a
+        // group is only ever what the queue already held.
+        while let Ok(next) = requests.try_recv() {
+            group.push(next);
+        }
+
+        let mut answers = Vec::with_capacity(group.len());
+        for request in group.drain(..) {
+            match request {
+                Request::Partial { path, reply } => {
+                    // Answered from memory and outside the flush: reading what is known
+                    // needs no device round trip, and the record it might read was made
+                    // durable by the group that carried it.
+                    let _ = reply.send(journal.partial(&path));
+                }
+                Request::Started {
+                    path,
+                    expected,
+                    reply,
+                } => answers.push((reply, journal.record_started(path, expected))),
+                Request::Forget { path, reply } => answers.push((reply, journal.forget(&path))),
             }
-            Request::Started {
-                path,
-                expected,
-                reply,
-            } => {
-                let _ = reply.send(journal.started(path, expected));
-            }
-            Request::Forget { path, reply } => {
-                let _ = reply.send(journal.forget(&path));
-            }
+        }
+
+        // One flush for the group, and its outcome belongs to every record in it: a caller
+        // told its record is safe when the flush failed would be a caller lied to.
+        let flushed = journal.commit();
+        for (reply, recorded) in answers {
+            // A caller that gave up before the answer arrived is not an error: the transfer
+            // it belonged to already failed for its own reason.
+            let _ = reply.send(recorded.and(clone_outcome(&flushed)));
         }
     }
 
     journal.compact()
+}
+
+/// Repeats one flush's outcome for every caller waiting on it.
+///
+/// [`JournalError`] carries an [`std::io::Error`], which cannot be cloned; every caller in
+/// the group still has to hear the same thing, so the failure is restated rather than
+/// shared.
+fn clone_outcome(flushed: &Result<(), JournalError>) -> Result<(), JournalError> {
+    match flushed {
+        Ok(()) => Ok(()),
+        Err(failure) => Err(JournalError::Io {
+            operation: "flushing the journal",
+            path: PathBuf::new(),
+            source: std::io::Error::other(failure.to_string()),
+        }),
+    }
 }
 
 #[cfg(test)]
