@@ -24,6 +24,10 @@ cargo run -p spd-cli -- doctor
 CI runs `cargo xtask ci` on Linux, Windows and macOS, plus `cargo-deny` and a check that
 `spd-core` pulled in no UI dependency.
 
+`release.yml` runs after a green `ci` on `main` and publishes `build v<short sha>`, with
+binaries for Linux (glibc and static musl), Windows and macOS. Several commits pushed
+together produce one release, for the last of them.
+
 ## Rules
 
 Full list in `PLAN.md §13`. The ones that bite most often:

@@ -1,0 +1,134 @@
+name: release
+
+# Every commit that lands on main and passes ci becomes a release. Triggered by ci
+# finishing rather than by the push itself: a binary from a commit whose tests failed is
+# worse than no binary, and this is the only way to know the answer before building.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+# Several commits pushed together produce one release, for the last of them: a run that
+# starts cancels whichever older one is still going. The group is the workflow, not the
+# commit, which is what makes them queue behind each other rather than race.
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    # `ci` also runs on pull requests and on a red commit; neither is worth a binary.
+    if: github.event.workflow_run.conclusion == 'success'
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          # Statically linked, so it runs on a distribution older than the runner's.
+          # The gnu build above needs the runner's glibc or newer, which rules out a
+          # server that has not been upgraded in a while.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar
+    steps:
+      # The commit ci ran on, not whatever main points at now: those differ the moment
+      # another push lands while this is building.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install the musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - run: cargo build --release --locked --package spd-cli --target ${{ matrix.target }}
+
+      - name: Pack the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "dist/spd-${{ matrix.target }}.zip" \
+                 "./target/${{ matrix.target }}/release/spd.exe" \
+                 ./README.md ./CHANGELOG.md
+          else
+            tar --create --gzip \
+                --file "dist/spd-${{ matrix.target }}.tar.gz" \
+                --directory "target/${{ matrix.target }}/release" spd
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spd-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A git tag cannot hold a space, so the tag is hyphenated and the release is named
+      # the way it was asked for. Both carry the same commit, which is the point of either.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          short="${SHA:0:7}"
+          # HEAD is the commit checked out above, which is the one ci ran on.
+          subject=$(git log -1 --pretty=%s)
+
+          {
+            echo "$subject"
+            echo
+            echo "Built from \`$SHA\`."
+            echo
+            echo "| File | For |"
+            echo "|---|---|"
+            echo "| \`spd-x86_64-unknown-linux-gnu.tar.gz\` | Linux, glibc 2.35 or newer |"
+            echo "| \`spd-x86_64-unknown-linux-musl.tar.gz\` | Linux, any distribution (static) |"
+            echo "| \`spd-x86_64-pc-windows-msvc.zip\` | Windows |"
+            echo "| \`spd-aarch64-apple-darwin.tar.gz\` | macOS, Apple silicon |"
+          } > notes.md
+
+          gh release create "build-v${short}" \
+            --title "build v${short}" \
+            --notes-file notes.md \
+            --target "$SHA" \
+            dist/*
