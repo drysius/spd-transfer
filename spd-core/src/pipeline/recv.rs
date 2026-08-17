@@ -421,6 +421,7 @@ async fn negotiate(
     limits: &Limits,
 ) -> Result<HashMap<FileId, Wanted>, PipelineError> {
     let mut wanted = HashMap::new();
+    let examiners = Arc::new(Semaphore::new(options.jobs.disk_write_jobs.get() as usize));
 
     loop {
         let message = reader.recv().await?;
@@ -447,26 +448,48 @@ async fn negotiate(
             });
         }
 
-        let mut decisions = Vec::with_capacity(entries.len());
+        // Deciding about one file is a stat, sometimes a read of the whole file, and
+        // sometimes a timestamp put right - all of it disk work about a file nobody else in
+        // this batch is looking at. Done one after another it was the slowest part of a
+        // large transfer, with the link idle and one file being read at a time; done
+        // together it is bounded by `disk_write_jobs`, the same knob that bounds writing.
+        let mut examined = Vec::with_capacity(entries.len());
         for entry in entries {
-            // Validate before anything touches the filesystem, so a hostile path costs
-            // nothing more than a rejected session.
+            // Validated before anything touches the filesystem, and here rather than in the
+            // task, so a hostile path costs nothing more than a rejected session.
             let relative = SafeRelPath::from_components(&entry.path, limits)?;
             let target = relative.resolve_under(destination)?;
 
-            let local = inspect(&target, &entry, options.checksum).await;
-            let partial = unfinished(&target, &relative, &entry, state).await?;
-            let decision = decide(&entry, local, partial);
+            let state = state.clone();
+            let permits = Arc::clone(&examiners);
+            let checksum = options.checksum;
 
-            // Skipped on proof of content, but carrying the wrong date: the only way to
-            // reach here is a hash that matched while the timestamps did not. Setting it
-            // now costs one call and no bytes, and it is what stops the next run having to
-            // hash the whole tree again to learn the same thing.
-            if matches!(decision, Decision::Skip)
-                && local.is_some_and(|local| local.mtime != entry.mtime)
-            {
-                apply_mtime(&target, entry.mtime).await;
-            }
+            examined.push(tokio::spawn(async move {
+                let _permit = permits.acquire().await.map_err(closed)?;
+
+                let local = inspect(&target, &entry, checksum).await;
+                let partial = unfinished(&target, &relative, &entry, &state).await?;
+                let decision = decide(&entry, local, partial);
+
+                // Skipped on proof of content, but carrying the wrong date: the only way to
+                // reach here is a hash that matched while the timestamps did not. Setting it
+                // now costs one call and no bytes, and it is what stops the next run having
+                // to read the whole tree again to learn the same thing.
+                if matches!(decision, Decision::Skip)
+                    && local.is_some_and(|local| local.mtime != entry.mtime)
+                {
+                    apply_mtime(&target, entry.mtime).await;
+                }
+
+                Ok::<_, PipelineError>((entry, relative, target, decision))
+            }));
+        }
+
+        // Collected in the order they were offered: the reply is positional, so an answer
+        // that arrives early still has to wait for its place.
+        let mut decisions = Vec::with_capacity(examined.len());
+        for examining in examined {
+            let (entry, relative, target, decision) = examining.await.map_err(joined_error)??;
 
             if let Decision::Need { from_offset, .. } = decision {
                 // Checked as they accumulate, not per batch: a peer can send any number of
@@ -546,6 +569,12 @@ async fn unfinished(
 }
 
 /// Looks at the local copy, hashing it only when a hash could actually change the answer.
+///
+/// A hash on the offer means the other side went to the trouble of computing one, and
+/// answering it with a timestamp would throw away the only evidence that actually proves
+/// anything. Reading the local copy is the price of that proof - which is why a routine
+/// synchronisation is better served by `--no-prehash`, where neither side hashes and the
+/// cheap facts decide.
 async fn inspect(target: &Path, entry: &Entry, checksum: bool) -> Option<LocalFile> {
     let metadata = fs::metadata(target).await.ok()?;
     if !metadata.is_file() {
@@ -553,6 +582,7 @@ async fn inspect(target: &Path, entry: &Entry, checksum: bool) -> Option<LocalFi
     }
 
     let size = metadata.len();
+    let mtime = mtime_of(&metadata);
     let worth_hashing = size == entry.size && (entry.hash.is_some() || checksum);
 
     let hash = if worth_hashing {
@@ -565,11 +595,7 @@ async fn inspect(target: &Path, entry: &Entry, checksum: bool) -> Option<LocalFi
         None
     };
 
-    Some(LocalFile {
-        size,
-        mtime: mtime_of(&metadata),
-        hash,
-    })
+    Some(LocalFile { size, mtime, hash })
 }
 
 /// What arrived on the data stream.
