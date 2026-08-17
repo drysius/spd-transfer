@@ -5,6 +5,8 @@
 //! both sides implement. Unknown bits are dropped on decode rather than rejected — that
 //! is what lets a newer peer talk to an older one once versions become compatible.
 
+use crate::safety::path::NamePolicy;
+
 /// Wire protocol version this build speaks.
 ///
 /// Bump on any incompatible change to the control stream or data headers. The golden
@@ -38,21 +40,38 @@ impl Features {
     /// actually given a code. The intersection is then exactly "both of us are pairing".
     pub const PAIRING: Self = Self(1 << 3);
 
+    /// This side can hold names Windows forbids: `<>:"|?*`, a trailing dot or space, and
+    /// the reserved device names.
+    ///
+    /// Conditional like [`Self::PAIRING`], and for a stronger reason: the intersection is
+    /// "both filesystems can hold such a name", which is exactly the question the sender
+    /// has to answer before it offers one. A Windows peer never announces it, so a name it
+    /// could not write is never sent to it.
+    pub const POSIX_NAMES: Self = Self(1 << 4);
+
     /// Every bit this build knows how to read.
-    pub const SUPPORTED: Self =
-        Self(Self::ZSTD.0 | Self::RESUME.0 | Self::HASH_CACHE.0 | Self::PAIRING.0);
+    pub const SUPPORTED: Self = Self(
+        Self::ZSTD.0 | Self::RESUME.0 | Self::HASH_CACHE.0 | Self::PAIRING.0 | Self::POSIX_NAMES.0,
+    );
 
     /// Everything this build implements and offers unconditionally.
     pub const ALWAYS: Self = Self(Self::ZSTD.0 | Self::RESUME.0 | Self::HASH_CACHE.0);
 
-    /// What this side announces, given whether it was handed a pairing code.
+    /// What this side announces, given whether it was handed a pairing code and which
+    /// names its own configuration allows.
     #[must_use]
-    pub const fn announced(pairing: bool) -> Self {
+    pub const fn announced(pairing: bool, names: NamePolicy) -> Self {
+        let mut bits = Self::ALWAYS.0;
+
         if pairing {
-            Self(Self::ALWAYS.0 | Self::PAIRING.0)
-        } else {
-            Self::ALWAYS
+            bits |= Self::PAIRING.0;
         }
+
+        if !names.rejects_windows_traps() {
+            bits |= Self::POSIX_NAMES.0;
+        }
+
+        Self(bits)
     }
 
     /// Raw bits, for putting on the wire.
@@ -151,7 +170,12 @@ mod tests {
     #[test]
     fn negotiation_keeps_only_shared_features() {
         let peer = Features::ZSTD.bits();
-        let agreed = negotiate(PROTOCOL_VERSION, peer, Features::announced(false)).unwrap();
+        let agreed = negotiate(
+            PROTOCOL_VERSION,
+            peer,
+            Features::announced(false, NamePolicy::Portable),
+        )
+        .unwrap();
 
         assert!(agreed.features.contains(Features::ZSTD));
         assert!(!agreed.features.contains(Features::RESUME));
@@ -172,7 +196,7 @@ mod tests {
         let agreed = negotiate(
             PROTOCOL_VERSION,
             Features::NONE.bits(),
-            Features::announced(false),
+            Features::announced(false, NamePolicy::Portable),
         )
         .unwrap();
         assert!(agreed.features.is_empty());
@@ -182,27 +206,56 @@ mod tests {
     fn pairing_is_agreed_only_when_both_sides_were_given_a_code() {
         let both = negotiate(
             PROTOCOL_VERSION,
-            Features::announced(true).bits(),
-            Features::announced(true),
+            Features::announced(true, NamePolicy::Portable).bits(),
+            Features::announced(true, NamePolicy::Portable),
         )
         .unwrap();
         assert!(both.features.contains(Features::PAIRING));
 
         let only_them = negotiate(
             PROTOCOL_VERSION,
-            Features::announced(true).bits(),
-            Features::announced(false),
+            Features::announced(true, NamePolicy::Portable).bits(),
+            Features::announced(false, NamePolicy::Portable),
         )
         .unwrap();
         assert!(!only_them.features.contains(Features::PAIRING));
 
         let only_us = negotiate(
             PROTOCOL_VERSION,
-            Features::announced(false).bits(),
-            Features::announced(true),
+            Features::announced(false, NamePolicy::Portable).bits(),
+            Features::announced(true, NamePolicy::Portable),
         )
         .unwrap();
         assert!(!only_us.features.contains(Features::PAIRING));
+    }
+
+    /// The bit has to mean "both of us", not "one of us wants to": a sender that offered a
+    /// name on its own say-so would hand a Windows receiver a file it cannot create.
+    #[test]
+    fn unix_only_names_are_agreed_only_when_both_filesystems_hold_them() {
+        let both = negotiate(
+            PROTOCOL_VERSION,
+            Features::announced(false, NamePolicy::Posix).bits(),
+            Features::announced(false, NamePolicy::Posix),
+        )
+        .unwrap();
+        assert!(both.features.contains(Features::POSIX_NAMES));
+
+        let only_the_sender = negotiate(
+            PROTOCOL_VERSION,
+            Features::announced(false, NamePolicy::Portable).bits(),
+            Features::announced(false, NamePolicy::Posix),
+        )
+        .unwrap();
+        assert!(!only_the_sender.features.contains(Features::POSIX_NAMES));
+
+        let only_the_receiver = negotiate(
+            PROTOCOL_VERSION,
+            Features::announced(false, NamePolicy::Posix).bits(),
+            Features::announced(false, NamePolicy::Portable),
+        )
+        .unwrap();
+        assert!(!only_the_receiver.features.contains(Features::POSIX_NAMES));
     }
 
     #[test]

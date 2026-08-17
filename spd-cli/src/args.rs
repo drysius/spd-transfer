@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use spd_core::pipeline::budget::JobLimits;
 use spd_core::pipeline::retry::RetryPolicy;
+use spd_core::safety::path::NamePolicy;
 
 /// Peer-to-peer file and folder transfer over QUIC.
 #[derive(Debug, Parser)]
@@ -35,6 +36,25 @@ pub(crate) enum LogFormat {
     Text,
     /// One JSON object per event, for a log collector.
     Json,
+}
+
+/// Which file names a transfer is allowed to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Names {
+    /// Only names every platform can write. A folder received here still opens on Windows.
+    Portable,
+    /// Also names that are ordinary on Unix and impossible on Windows, such as `?` or a
+    /// trailing dot. Both sides have to allow it, and neither side may be on Windows.
+    Posix,
+}
+
+impl From<Names> for NamePolicy {
+    fn from(names: Names) -> Self {
+        match names {
+            Names::Portable => Self::Portable,
+            Names::Posix => Self::Posix,
+        }
+    }
 }
 
 /// Available subcommands.
@@ -125,6 +145,11 @@ pub(crate) struct SendArgs {
     #[arg(long, value_name = "MIB")]
     pub(crate) limit_rate_mb: Option<u64>,
 
+    /// Which names may be sent. `posix` also offers names Windows forbids, such as `?`,
+    /// and only if the receiver says it can write them too.
+    #[arg(long, value_enum, default_value_t = Names::Portable, value_name = "POLICY")]
+    pub(crate) names: Names,
+
     /// Print what the transfer cost when it ends: bytes, compression, throughput, time.
     #[arg(long)]
     pub(crate) stats: bool,
@@ -210,6 +235,12 @@ pub(crate) struct RecvArgs {
     /// leave the machine room for something else.
     #[arg(long, default_value_t = default_cpu_jobs(), value_name = "N")]
     pub(crate) cpu_jobs: u32,
+
+    /// Which names may be written here. `posix` also accepts names Windows forbids, such
+    /// as `?`; the sender is told, and holds back those files if it is not set on both
+    /// sides.
+    #[arg(long, value_enum, default_value_t = Names::Portable, value_name = "POLICY")]
+    pub(crate) names: Names,
 
     /// How many sessions to accept before giving up, counting the first. A sender that
     /// reconnects finds the listener still waiting and continues where it stopped.

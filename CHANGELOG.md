@@ -5,6 +5,20 @@ Dates are the day the work was finished.
 
 ## Unreleased
 
+### Added
+
+- **`--names posix`, for trees that never leave Unix.** A file called `?`, one ending in a
+  dot, or one called `CON` is ordinary on Linux and impossible on Windows, and until now it
+  was always left behind - which on a server directory meant a backup quietly missing files.
+  Pass `--names posix` on **both** sides and those names cross as they are. It stays off by
+  default, so a received folder still opens on Windows, and it is refused outright on
+  Windows, where such a name cannot be written at all.
+  The two sides agree through a feature bit rather than the sender deciding alone: if the
+  receiver did not ask for it, the sender never offers those names and reports them under
+  `not sent`, exactly as before. Nothing that keeps a path inside the destination changes -
+  `..`, separators, control characters and the depth and length limits are refused under
+  either setting.
+
 ### Fixed
 
 - **A live tree no longer fails the whole transfer.** A file that existed when the directory

@@ -285,11 +285,17 @@ The constructor rejects:
 - Windows reserved names: `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9` (with or
   without an extension)
 - a trailing dot or space in any component (Windows strips them silently)
-- control characters (`\0`-`\x1F`) and, on Windows, `<>:"|?*`
+- control characters (`\0`-`\x1F`) and `<>:"|?*`
 - depth above the limit; total length above the limit
 
 `resolve_under` canonicalises the parent directory and asserts `starts_with(root)` before
 returning. Covered by proptest and by a fuzz target.
+
+The Windows-specific half of that list - `<>:"|?*`, the trailing dot or space, the device
+names - is a policy, `Limits::names`, not a constant. `portable` is the default and holds
+everywhere; `posix` carries those names as they are, and only when both sides announced
+`POSIX_NAMES`, which a Windows peer never does. The traversal rules are not part of the
+choice and apply under both.
 
 ### Symlinks
 
@@ -317,7 +323,7 @@ out-of-root writing through another door.
 
 `max_frame_len_bytes` · `max_manifest_entries` · `max_files` · `max_path_depth` ·
 `max_path_len_bytes` · `max_concurrent_streams` · `handshake_timeout` · `idle_timeout` ·
-`max_file_size_bytes`
+`max_file_size_bytes` · `names`
 
 `max_manifest_entries` bounds one message and `max_files` bounds the whole conversation:
 without the second, a peer sends a million well-sized batches and the receiver allocates
@@ -557,6 +563,22 @@ validating a path 335 ns, walking 200 files 8.8 ms.
 End-to-end throughput is not a criterion benchmark. It is a property of the disk and the
 link rather than of this code, and a number that moves with whatever else the machine is
 doing teaches nothing; the figures under F4 stand instead.
+
+### F10 - Names that only exist on Unix - **done**
+A tree that never leaves Linux can hold names Windows has no way to write, and 0.1.0 left
+every one of them behind. `--names posix` on both sides carries them; `--names portable`
+stays the default, because a folder that opens on the other machine is worth more than one
+extra file in the common case.
+Decided as a capability, not a flag the sender acts on alone: `Features::POSIX_NAMES` is
+announced by a side whose own configuration allows such names, and the sender scans under
+the *negotiated* answer. A Windows peer never announces it - `Limits::validate` refuses the
+setting there - so a name that cannot be written is never offered rather than failing on the
+receiver's disk halfway through. Everything that keeps a path inside its root is untouched
+and applies under both policies.
+Shipped: `NamePolicy` in `safety/path.rs`, `Limits::names`, the feature bit, `--names` on
+`send` and `recv`, and the end-to-end pair in `tests/path_safety.rs` - the name crosses when
+both sides allow it, and is held back when only the sender does. The wire format did not
+move: the golden files are unchanged.
 
 ---
 

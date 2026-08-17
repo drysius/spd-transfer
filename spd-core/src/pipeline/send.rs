@@ -34,7 +34,9 @@ use crate::pipeline::rate::{Meter, RateLimit};
 use crate::pipeline::{PipelineError, TransferSummary};
 use crate::proto::codec::{ControlReader, ControlWriter, write_data_header};
 use crate::proto::messages::{Control, DataHeader, Decision, FileId};
+use crate::proto::version::Features;
 use crate::safety::limits::Limits;
+use crate::safety::path::NamePolicy;
 use crate::scan::hash_cache::{HASH_SIZE_CEILING_BYTES, HashCache, hash_file};
 use crate::scan::manifest::{Manifest, ManifestFile, batches};
 use crate::scan::walk::{Unportable, WalkOptions, walk};
@@ -126,6 +128,8 @@ pub async fn send_tree(
     options: SendOptions,
     limits: &Limits,
 ) -> Result<SendReport, PipelineError> {
+    let limits = &agreed_names(limits, &session);
+
     let scanning = std::time::Instant::now();
     let (manifest, unportable) = build_manifest(root, &options, limits).await?;
     let scanned_in = scanning.elapsed();
@@ -487,6 +491,33 @@ fn joined_error(joined: tokio::task::JoinError) -> PipelineError {
 }
 
 /// Scans the tree and fills in the hashes that are cheap to know.
+/// The limits to scan under, with the name policy the receiver actually agreed to.
+///
+/// Asked before the tree is walked, so a name the other side cannot write is left behind
+/// with a reason the user can read - rather than offered, accepted, and failing on the
+/// receiver's disk halfway through the transfer.
+fn agreed_names(limits: &Limits, session: &Session) -> Limits {
+    if limits.names.rejects_windows_traps()
+        || session
+            .peer()
+            .negotiated
+            .features
+            .contains(Features::POSIX_NAMES)
+    {
+        return *limits;
+    }
+
+    tracing::info!(
+        peer = %session.peer().device,
+        "the receiver cannot write names Windows forbids; scanning as if --names portable"
+    );
+
+    Limits {
+        names: NamePolicy::Portable,
+        ..*limits
+    }
+}
+
 async fn build_manifest(
     root: &Path,
     options: &SendOptions,

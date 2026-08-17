@@ -316,6 +316,35 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The same tree under a session that agreed both sides are on Unix: nothing is left
+    /// behind, because there is nothing the receiver could not call it.
+    #[cfg(unix)]
+    #[test]
+    fn a_posix_session_carries_the_names_a_portable_one_leaves_behind() {
+        use crate::safety::path::NamePolicy;
+
+        let root = scratch("posix-names");
+        std::fs::write(root.join("ordinary.txt"), b"fine").unwrap();
+        std::fs::write(root.join("?"), b"named after a wildcard").unwrap();
+
+        let limits = Limits {
+            names: NamePolicy::Posix,
+            ..Limits::DEFAULT
+        };
+        let found = walk(&root, WalkOptions::default(), &limits).unwrap();
+
+        assert!(found.unportable.is_empty(), "nothing is left behind");
+        assert!(
+            found
+                .files
+                .iter()
+                .any(|file| file.relative.to_string() == "?"),
+            "the file called ? is offered like any other"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn only_a_missing_file_is_tolerated() {
         use std::io::{Error, ErrorKind};

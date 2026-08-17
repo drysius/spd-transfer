@@ -9,6 +9,7 @@ use spd_core::proto::codec::ProtoError;
 use spd_core::proto::messages::{Control, DeviceId, ErrorCode};
 use spd_core::proto::version::{Features, PROTOCOL_VERSION};
 use spd_core::safety::limits::Limits;
+use spd_core::safety::path::NamePolicy;
 use spd_core::transport::{Authentication, connect, listen};
 
 fn loopback() -> SocketAddr {
@@ -69,7 +70,7 @@ async fn peers_negotiate_and_then_talk_over_the_control_stream() {
     assert_eq!(caller.peer().negotiated.version, PROTOCOL_VERSION);
     assert_eq!(
         caller.peer().negotiated.features,
-        Features::announced(false),
+        Features::announced(false, NamePolicy::Portable),
         "unpaired peers agree on everything except pairing"
     );
 
@@ -95,7 +96,10 @@ async fn peers_negotiate_and_then_talk_over_the_control_stream() {
 
     let (seen_device, negotiated, first, hangup) = accepting.await.unwrap();
     assert_eq!(seen_device, caller_device);
-    assert_eq!(negotiated.features, Features::announced(false));
+    assert_eq!(
+        negotiated.features,
+        Features::announced(false, NamePolicy::Portable)
+    );
     assert_eq!(
         first,
         Control::Error {

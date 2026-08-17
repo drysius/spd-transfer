@@ -186,6 +186,91 @@ async fn a_peer_cannot_offer_more_files_than_the_limit_allows() {
     hostile.close("done");
 }
 
+/// Sends `source` to a fresh destination and hands back both, so a test can assert on what
+/// arrived. The two sides carry their own limits on purpose: what they disagree about is
+/// the subject of these tests.
+#[cfg(unix)]
+async fn transfer(source: &Scratch, sending: Limits, receiving_with: Limits) -> Scratch {
+    let destination = Scratch::new("names-dest");
+    let (listener, address) = bound_listener(receiving_with);
+    let into = destination.path().to_path_buf();
+
+    let receiving = tokio::spawn(async move {
+        let session = listener.accept().await.unwrap();
+        receive_tree(session, &into, ReceiveOptions::default(), &receiving_with)
+            .await
+            .unwrap()
+    });
+
+    let sender = dial(address, sending).await;
+    spd_core::pipeline::send::send_tree(
+        sender,
+        source.path(),
+        spd_core::pipeline::send::SendOptions::default(),
+        &sending,
+    )
+    .await
+    .unwrap();
+
+    receiving.await.unwrap();
+    destination
+}
+
+/// A tree with one ordinary file and one named after a wildcard, which is what a game
+/// server or a plugin cache actually looks like on Linux.
+#[cfg(unix)]
+fn tree_with_an_unportable_name() -> Scratch {
+    let source = Scratch::new("names-source");
+    source.write("ordinary.txt", b"fine");
+    std::fs::create_dir_all(source.path().join("?")).unwrap();
+    source.write("?/README.txt", b"ordinary here, impossible on Windows");
+    source
+}
+
+/// Unix only, both ways round: a name like `?` cannot be created on Windows, so there is
+/// nothing there to send and nothing to receive.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_unix_only_name_crosses_when_both_sides_allow_it() {
+    let posix = Limits {
+        names: spd_core::safety::path::NamePolicy::Posix,
+        ..Limits::DEFAULT
+    };
+
+    let source = tree_with_an_unportable_name();
+    let destination = transfer(&source, posix, posix).await;
+
+    assert_eq!(
+        std::fs::read(destination.path().join("?").join("README.txt")).unwrap(),
+        b"ordinary here, impossible on Windows",
+        "the file the old build left behind is the one that has to arrive"
+    );
+    assert!(destination.path().join("ordinary.txt").exists());
+}
+
+/// The sender allows it, the receiver does not. The name must not be offered at all: it is
+/// the receiver that would have to write it, and it has said it cannot.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_unix_only_name_is_held_back_when_the_receiver_cannot_write_it() {
+    let posix = Limits {
+        names: spd_core::safety::path::NamePolicy::Posix,
+        ..Limits::DEFAULT
+    };
+
+    let source = tree_with_an_unportable_name();
+    let destination = transfer(&source, posix, Limits::DEFAULT).await;
+
+    assert!(
+        !destination.path().join("?").exists(),
+        "a name the receiver cannot write is never offered"
+    );
+    assert!(
+        destination.path().join("ordinary.txt").exists(),
+        "and the rest of the tree still goes"
+    );
+}
+
 #[tokio::test]
 async fn an_ordinary_nested_path_is_still_accepted() {
     let source = Scratch::new("traversal-ok-source");

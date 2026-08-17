@@ -15,6 +15,7 @@ use spd_core::proto::messages::{
     Control, DataHeader, Decision, DeviceId, Entry, ErrorCode, FileId,
 };
 use spd_core::proto::version::{Features, PROTOCOL_VERSION};
+use spd_core::safety::path::NamePolicy;
 
 /// Where the frozen bytes live.
 fn golden(name: &str) -> PathBuf {
@@ -62,7 +63,7 @@ fn every_message() -> Vec<(&'static str, Control)> {
             "hello",
             Control::Hello {
                 version: PROTOCOL_VERSION,
-                features: Features::announced(true).bits(),
+                features: Features::announced(true, NamePolicy::Portable).bits(),
                 device: device(),
             },
         ),
@@ -70,7 +71,7 @@ fn every_message() -> Vec<(&'static str, Control)> {
             "hello_ack",
             Control::HelloAck {
                 version: PROTOCOL_VERSION,
-                features: Features::announced(false).bits(),
+                features: Features::announced(false, NamePolicy::Portable).bits(),
                 device: device(),
             },
         ),

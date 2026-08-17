@@ -71,7 +71,7 @@ impl Session {
             .await
             .map_err(|source| TransportError::Connection { source })?;
 
-        let announced = Features::announced(auth.requires_pairing());
+        let announced = Features::announced(auth.requires_pairing(), limits.names);
         let mut control = ControlChannel::new(send, recv, limits);
         control
             .send(&hello(device, announced, announced_version))
@@ -145,7 +145,7 @@ impl Session {
             .await
             .map_err(|source| TransportError::Connection { source })?;
 
-        let announced = Features::announced(auth.requires_pairing());
+        let announced = Features::announced(auth.requires_pairing(), limits.names);
         let mut control = ControlChannel::new(send, recv, limits);
 
         let opening = control.recv().await?;

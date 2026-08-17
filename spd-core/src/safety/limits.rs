@@ -6,6 +6,8 @@
 
 use core::time::Duration;
 
+use crate::safety::path::NamePolicy;
+
 /// Smallest control frame that still fits a batched manifest message.
 ///
 /// Below this the protocol cannot make progress, so a smaller value is a configuration
@@ -51,6 +53,12 @@ pub struct Limits {
 
     /// Largest single file accepted, in bytes.
     pub max_file_size_bytes: u64,
+
+    /// Which file names this side is willing to carry.
+    ///
+    /// A bound like the others: it is what this machine will accept from a peer, and the
+    /// one place the answer is written down.
+    pub names: NamePolicy,
 }
 
 impl Limits {
@@ -67,6 +75,7 @@ impl Limits {
         handshake_timeout: Duration::from_secs(10),
         idle_timeout: Duration::from_secs(60),
         max_file_size_bytes: 1 << 42, // 4 TiB
+        names: NamePolicy::Portable,
     };
 
     /// Checks that this set of limits is internally consistent.
@@ -78,6 +87,7 @@ impl Limits {
     /// [`LimitsError::Zero`] if a field that must be positive is zero.
     /// [`LimitsError::FrameTooSmall`] if `max_frame_len_bytes` cannot hold a manifest
     /// batch.
+    /// [`LimitsError::NamesUnwritable`] if [`NamePolicy::Posix`] was asked for on Windows.
     pub fn validate(&self) -> Result<(), LimitsError> {
         // Widened to u128 so `Duration::as_millis` joins the list without a lossy cast.
         let positive = [
@@ -103,6 +113,12 @@ impl Limits {
                 got: self.max_frame_len_bytes,
                 min: MIN_FRAME_LEN_BYTES,
             });
+        }
+
+        // Refused here rather than file by file: this machine cannot create such a name at
+        // all, so the setting would only produce a transfer that fails halfway through.
+        if cfg!(windows) && self.names == NamePolicy::Posix {
+            return Err(LimitsError::NamesUnwritable);
         }
 
         Ok(())
@@ -136,6 +152,10 @@ pub enum LimitsError {
         /// Smallest workable value.
         min: usize,
     },
+
+    /// Unix-only names were asked for on a machine that cannot write them.
+    #[error("--names posix cannot be used on Windows, which has no way to write those names")]
+    NamesUnwritable,
 }
 
 #[cfg(test)]
@@ -176,6 +196,22 @@ mod tests {
                 min: MIN_FRAME_LEN_BYTES,
             }
         );
+    }
+
+    /// The same setting is valid on Unix and impossible on Windows, so the assertion is on
+    /// the platform this build runs on rather than on a constant.
+    #[test]
+    fn unix_only_names_are_accepted_only_where_they_can_be_written() {
+        let limits = Limits {
+            names: NamePolicy::Posix,
+            ..Limits::DEFAULT
+        };
+
+        if cfg!(windows) {
+            assert_eq!(limits.validate().unwrap_err(), LimitsError::NamesUnwritable);
+        } else {
+            assert!(limits.validate().is_ok());
+        }
     }
 
     #[test]

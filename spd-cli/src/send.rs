@@ -32,8 +32,10 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
 
     let limits = Limits {
         max_concurrent_streams: streams.get(),
+        names: args.names.into(),
         ..Limits::DEFAULT
     };
+    limits.validate()?;
 
     let progress = Progress::new();
     let options = SendOptions {
@@ -142,6 +144,7 @@ fn report_unportable(unportable: &[spd_core::scan::walk::Unportable]) {
         unportable.len()
     );
     eprintln!("         written on Windows, so the receiver was never offered them.");
+    eprintln!("         If neither side is on Windows, pass --names posix on both.");
 }
 
 /// Turns `--limit-rate-mb` into a rate, refusing a limit of zero.

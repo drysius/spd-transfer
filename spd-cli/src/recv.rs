@@ -34,8 +34,10 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
 
     let limits = Limits {
         max_concurrent_streams: streams.get(),
+        names: args.names.into(),
         ..Limits::DEFAULT
     };
+    limits.validate()?;
 
     let progress = Progress::new();
     let options = ReceiveOptions {

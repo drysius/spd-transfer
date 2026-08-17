@@ -23,6 +23,39 @@ const WINDOWS_RESERVED: [&str; 22] = [
 /// the reserved names.
 const WINDOWS_FORBIDDEN: [char; 7] = ['<', '>', ':', '"', '|', '?', '*'];
 
+/// Which names a session is willing to carry.
+///
+/// The strict rules above exist so a folder received on Linux is still usable after being
+/// copied to Windows. That is the right default and the wrong answer for a tree that will
+/// never leave Unix: a game server directory containing a file called `?` is not a folder
+/// anyone can rename, and refusing to carry it means the backup silently misses files.
+///
+/// So it is a choice, made once per session and only ever loosened when *both* sides say
+/// their filesystem can hold such a name - see [`Features::POSIX_NAMES`]. A Windows
+/// receiver never says that, so a name it could not write never reaches it.
+///
+/// [`Features::POSIX_NAMES`]: crate::proto::version::Features::POSIX_NAMES
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NamePolicy {
+    /// Only names every supported platform can write. The default.
+    #[default]
+    Portable,
+
+    /// Also names that are ordinary on Unix and impossible on Windows: `<>:"|?*`, a
+    /// trailing dot or space, and the reserved device names.
+    ///
+    /// The rules that keep a path from escaping its root - `..`, separators, control
+    /// characters, the depth and length limits - are not part of this and still apply.
+    Posix,
+}
+
+impl NamePolicy {
+    /// Whether the Windows-specific rules are enforced.
+    pub const fn rejects_windows_traps(self) -> bool {
+        matches!(self, Self::Portable)
+    }
+}
+
 /// A validated path relative to a transfer root.
 ///
 /// Held as components rather than a string, so no separator has to be guessed when it
@@ -58,7 +91,7 @@ impl SafeRelPath {
         }
 
         for part in parts {
-            check_component(part)?;
+            check_component(part, limits.names)?;
         }
 
         Ok(Self {
@@ -148,7 +181,7 @@ impl core::fmt::Display for SafeRelPath {
     }
 }
 
-fn check_component(part: &str) -> Result<(), PathError> {
+fn check_component(part: &str, names: NamePolicy) -> Result<(), PathError> {
     if part.is_empty() {
         return Err(PathError::EmptyComponent);
     }
@@ -170,6 +203,12 @@ fn check_component(part: &str) -> Result<(), PathError> {
             component: part.to_owned(),
             code: found as u32,
         });
+    }
+
+    // Everything below is a Windows rule. A session that agreed both ends are on a
+    // filesystem without them carries the name as it is.
+    if !names.rejects_windows_traps() {
+        return Ok(());
     }
 
     if let Some(found) = part.chars().find(|c| WINDOWS_FORBIDDEN.contains(c)) {
@@ -374,6 +413,46 @@ mod tests {
         assert!(matches!(
             safe(&["C:"]).unwrap_err(),
             PathError::ForbiddenCharacter { .. }
+        ));
+    }
+
+    fn posix(values: &[&str]) -> Result<SafeRelPath, PathError> {
+        let limits = Limits {
+            names: NamePolicy::Posix,
+            ..Limits::DEFAULT
+        };
+        SafeRelPath::from_components(&parts(values), &limits)
+    }
+
+    #[test]
+    fn a_posix_session_carries_names_windows_could_not_write() {
+        assert_eq!(
+            posix(&["?", "README.txt"]).unwrap().to_string(),
+            "?/README.txt"
+        );
+        assert_eq!(posix(&["what?.txt"]).unwrap().file_name(), "what?.txt");
+        assert!(posix(&["CON"]).is_ok());
+        assert!(posix(&["report.txt "]).is_ok());
+        assert!(posix(&["a:b*c"]).is_ok());
+    }
+
+    #[test]
+    fn a_posix_session_still_cannot_escape_its_root() {
+        assert!(matches!(
+            posix(&["docs", ".."]).unwrap_err(),
+            PathError::Traversal { .. }
+        ));
+        assert!(matches!(
+            posix(&["docs/../etc"]).unwrap_err(),
+            PathError::Separator { .. }
+        ));
+        assert!(matches!(
+            posix(&["na\u{0}me"]).unwrap_err(),
+            PathError::ControlCharacter { .. }
+        ));
+        assert!(matches!(
+            posix(&[""]).unwrap_err(),
+            PathError::EmptyComponent
         ));
     }
 

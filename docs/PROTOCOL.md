@@ -81,10 +81,18 @@ means "both of us".
 | 1 | `RESUME` | understands `Decision::Need { from_offset }` |
 | 2 | `HASH_CACHE` | may put hashes in manifest entries |
 | 3 | `PAIRING` | **this session** will prove a pairing code |
+| 4 | `POSIX_NAMES` | **this side's filesystem** can hold names Windows forbids |
 
-Bits 0-2 say what a build implements and are always announced. Bit 3 says what this session
-is doing, and appears only when that side was given a code. Unknown bits are dropped on
-decode rather than rejected.
+Bits 0-2 say what a build implements and are always announced. Bits 3 and 4 say what this
+session is doing: bit 3 appears only when that side was given a code, bit 4 only when that
+side was configured to allow such names, which a Windows peer never is. Unknown bits are
+dropped on decode rather than rejected.
+
+`POSIX_NAMES` is what the sender asks before it walks its tree. Without it in the negotiated
+set, a name containing `<>:"|?*`, ending in a dot or a space, or matching a Windows device
+name is never offered - it is left behind and reported to the user. With it, such a name is
+carried as it is. Nothing else about path validation changes: `..`, separators, control
+characters and the depth and length limits are refused either way, on both sides.
 
 `device` is a random identifier for the peer installation. In version 1 it is a label for
 logs, not an authentication input.
