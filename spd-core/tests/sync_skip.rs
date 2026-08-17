@@ -191,6 +191,53 @@ async fn a_received_file_keeps_the_senders_timestamp() {
     }
 }
 
+/// A file whose content is proved identical but whose date is wrong gets the date fixed,
+/// without a byte crossing.
+///
+/// This is what makes one `--checksum` run enough to repair a tree copied by something that
+/// did not preserve timestamps: after it, size and mtime agree again, and every later run is
+/// cheap. Without it the tree would need hashing on every run, for ever.
+#[tokio::test]
+async fn a_skipped_file_with_the_wrong_date_has_it_put_right() {
+    let source = tree("mtime-repair-source");
+    let destination = Scratch::new("mtime-repair-dest");
+
+    transfer(source.path(), destination.path(), SendOptions::default()).await;
+
+    // Backdate the destination copy, the way a run that never carried timestamps left it.
+    let target = destination.path().join("notes.txt");
+    let wrong = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    filetime_restore(&target, wrong);
+
+    let repaired = transfer(
+        source.path(),
+        destination.path(),
+        SendOptions {
+            checksum: true,
+            ..SendOptions::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        repaired.transferred.files, 0,
+        "the content is identical, so nothing should move"
+    );
+
+    let source_time = std::fs::metadata(source.path().join("notes.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let fixed = std::fs::metadata(&target).unwrap().modified().unwrap();
+    let apart = source_time.duration_since(fixed).unwrap_or_default()
+        + fixed.duration_since(source_time).unwrap_or_default();
+
+    assert!(
+        apart < std::time::Duration::from_secs(2),
+        "a skipped file should be left with the date it has on the other side, not {apart:?} away"
+    );
+}
+
 #[tokio::test]
 async fn checksum_mode_notices_a_file_that_kept_its_size_and_timestamp() {
     let source = Scratch::new("checksum-source");

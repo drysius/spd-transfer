@@ -458,6 +458,16 @@ async fn negotiate(
             let partial = unfinished(&target, &relative, &entry, state).await?;
             let decision = decide(&entry, local, partial);
 
+            // Skipped on proof of content, but carrying the wrong date: the only way to
+            // reach here is a hash that matched while the timestamps did not. Setting it
+            // now costs one call and no bytes, and it is what stops the next run having to
+            // hash the whole tree again to learn the same thing.
+            if matches!(decision, Decision::Skip)
+                && local.is_some_and(|local| local.mtime != entry.mtime)
+            {
+                apply_mtime(&target, entry.mtime).await;
+            }
+
             if let Decision::Need { from_offset, .. } = decision {
                 // Checked as they accumulate, not per batch: a peer can send any number of
                 // batches that are individually within the limit.
