@@ -160,6 +160,37 @@ async fn skipping_the_prehash_still_delivers_the_tree_and_leaves_no_cache() {
     assert_eq!(second.skipped, 3);
 }
 
+/// A received file keeps the timestamp it had on the sender.
+///
+/// This is what makes the second run cheap when there are no hashes to compare: stamped
+/// with its arrival time instead, every file would look changed and the whole tree would
+/// move again, every single run.
+#[tokio::test]
+async fn a_received_file_keeps_the_senders_timestamp() {
+    let source = tree("mtime-source");
+    let destination = Scratch::new("mtime-dest");
+
+    transfer(source.path(), destination.path(), SendOptions::default()).await;
+
+    for name in ["notes.txt", "nested/photo.bin"] {
+        let sent = std::fs::metadata(source.path().join(name))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let arrived = std::fs::metadata(destination.path().join(name))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let apart = sent.duration_since(arrived).unwrap_or_default()
+            + arrived.duration_since(sent).unwrap_or_default();
+        assert!(
+            apart < std::time::Duration::from_secs(2),
+            "{name} arrived stamped {apart:?} away from the file it was copied from"
+        );
+    }
+}
+
 #[tokio::test]
 async fn checksum_mode_notices_a_file_that_kept_its_size_and_timestamp() {
     let source = Scratch::new("checksum-source");

@@ -370,6 +370,7 @@ async fn worker(
     commit(&partial, &file.target).await?;
     state.forget(file.relative.clone()).await?;
     apply_mode(&file.target, file.mode).await;
+    apply_mtime(&file.target, file.expected.mtime).await;
     progress.finished_file();
     tracing::info!(
         path = %file.relative,
@@ -870,6 +871,44 @@ fn joined_error(joined: tokio::task::JoinError) -> PipelineError {
         operation: "running a receive task",
         path: PathBuf::new(),
         source: std::io::Error::other(joined),
+    }
+}
+
+/// Gives the received file the modification time it had on the sender.
+///
+/// Without this a copied file is stamped with the moment it arrived, and the next run
+/// compares that against the sender's timestamp, finds them different, and sends the whole
+/// file again. Every run would move the whole tree - which is the one thing a synchronising
+/// transfer must not do.
+///
+/// Best effort: a filesystem that will not take a timestamp costs a resend later, never a
+/// wrong file now, and refusing a transfer over it would be absurd.
+async fn apply_mtime(target: &Path, mtime: u64) {
+    // Zero is the scan's word for "the filesystem could not say". Stamping it would claim
+    // 1970 and make every later comparison disagree on purpose.
+    if mtime == 0 {
+        return;
+    }
+
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
+    let target = target.to_path_buf();
+
+    let applied = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)?
+            .set_modified(when)
+    })
+    .await;
+
+    match applied {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "could not apply the sender's timestamp");
+        }
+        Err(joined) => {
+            tracing::debug!(%joined, "could not apply the sender's timestamp");
+        }
     }
 }
 
