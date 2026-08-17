@@ -597,6 +597,34 @@ The manifest is still built whole in memory before anything is offered, at rough
 per file. That is the next thing to fix and it is a redesign, not a flag; until then a tree
 of millions of files wants splitting, and the sender says so with a limit it names.
 
+### F12 - Small files in bundles - **planned**
+A stream per file is right until the files are tiny and there are millions of them. Then the
+cost stops being bytes and becomes the per-file exchange: open a stream, send `FileDone`,
+wait for `FileVerdict`, and only then take the next file off the queue. With 64 workers that
+is 64 files in flight, so the tail of a large tree moves at `workers / round trip` however
+fast the link is.
+
+The plan: files below `--bundle-below` (default 512 KiB) are packed into streams of up to
+`--bundle-size` (default 1 GiB), grouped by directory so the reads stay local. Two and a half
+million files become about three thousand streams. A bundle carries `(file_id, len, bytes)`
+in sequence and is compressed as one piece, which on small files beats compressing each of
+them: the dictionary spans the whole bundle instead of restarting every few hundred bytes.
+
+Decided: on by default with `--no-bundle` to opt out, because a tree that needs it should not
+depend on the user knowing the flag exists. Hashes stay per file - each one is still proved
+individually - but the confirmations travel together, `BundleDone { hashes }` and
+`BundleVerdict { failures }`, one exchange per bundle instead of one per file. That is where
+the round trips go. A file that fails is resent on its own, not as a gigabyte.
+
+Costs, written down so they are not a surprise: the wire format changes, so
+`PROTOCOL_VERSION` becomes 2 and the golden files are regenerated - there is no v1 peer to
+stay compatible with. Resume inside a bundle restarts that bundle rather than resuming
+mid-stream; files already finished are skipped by the diff on the next attempt, so the work
+lost is bounded by one bundle. And this does not touch the receiver's filesystem cost: two
+and a half million files still have to be created, written and renamed. If the tail turns out
+to be dominated by disk metadata rather than by round trips, this phase buys much less than
+it looks like it should, which is why it is measured before it is written.
+
 ---
 
 ## 11. Test strategy
