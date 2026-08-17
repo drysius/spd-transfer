@@ -32,6 +32,7 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
 
     let limits = Limits {
         max_concurrent_streams: streams.get(),
+        max_files: args.max_files,
         names: args.names.into(),
         ..Limits::DEFAULT
     };
@@ -42,6 +43,7 @@ pub(crate) async fn run(args: &SendArgs) -> Result<()> {
         follow_links: args.follow_links,
         checksum: args.checksum,
         dry_run: args.dry_run,
+        prehash: !args.no_prehash,
         compress: !args.no_compress,
         mem_budget_bytes: args.mem_budget_mb.saturating_mul(1024 * 1024),
         jobs: JobLimits {

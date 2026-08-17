@@ -14,9 +14,12 @@
 //! announced in the stream's header - the receiver obeys the header and never its own
 //! configuration, because only this side knows what it actually did.
 
+use core::num::NonZeroU32;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -28,7 +31,7 @@ use crate::metrics::Progress;
 use crate::pipeline::budget::{DEFAULT_MEM_BUDGET_BYTES, JobLimits, TransferPlan};
 use crate::pipeline::bufpool::{BufferPool, PooledBuffer};
 use crate::pipeline::control::{Outbox, spawn_outbox};
-use crate::pipeline::cpu::on_cpu;
+use crate::pipeline::cpu::{on_cores, on_cpu};
 use crate::pipeline::prefix::hash_prefix;
 use crate::pipeline::rate::{Meter, RateLimit};
 use crate::pipeline::{PipelineError, TransferSummary};
@@ -65,6 +68,15 @@ pub struct SendOptions {
     /// stream.
     pub dry_run: bool,
 
+    /// Hash files before offering them, so the receiver can skip the ones it already has
+    /// byte for byte.
+    ///
+    /// Worth it on a folder being synchronised again, where most files will be skipped and
+    /// the hash is what proves it. Pure cost on a first copy into an empty destination:
+    /// every byte is read and hashed to establish that the receiver has nothing, and only
+    /// then does anything move.
+    pub prehash: bool,
+
     /// Compress a file when it looks worth compressing. Off means every body crosses as it
     /// is, which is what a fast link and a busy processor want.
     pub compress: bool,
@@ -88,6 +100,7 @@ impl Default for SendOptions {
             follow_links: false,
             checksum: false,
             dry_run: false,
+            prehash: true,
             compress: true,
             mem_budget_bytes: DEFAULT_MEM_BUDGET_BYTES,
             jobs: JobLimits::DEFAULT,
@@ -133,6 +146,16 @@ pub async fn send_tree(
     let scanning = std::time::Instant::now();
     let (manifest, unportable) = build_manifest(root, &options, limits).await?;
     let scanned_in = scanning.elapsed();
+
+    // Said here, where the answer is already known, rather than discovered by the receiver
+    // a thousand manifest batches later: the tree is what it is, and a wait that ends in a
+    // refusal should be the short one.
+    if manifest.len() as u64 > limits.max_files {
+        return Err(PipelineError::TooManyFiles {
+            limit: "max_files",
+            max: limits.max_files,
+        });
+    }
 
     options
         .progress
@@ -529,56 +552,99 @@ async fn build_manifest(
     };
     let limits = *limits;
     let checksum = options.checksum;
+    let prehash = options.prehash;
+    let cpu_jobs = options.jobs.cpu_jobs;
 
     // Walking and hashing are both blocking disk work; keeping them off the async runtime
     // is the difference between a busy transfer and a stalled one.
     let scanned = tokio::task::spawn_blocking(move || {
         let scanned = walk(&root, walk_options, &limits)?;
+        // Said before the hashing rather than after all of it: on a large tree these are
+        // two long steps, and one silent wait that turns out to be two is what makes a
+        // running program look like a stuck one.
+        tracing::info!(files = scanned.files.len(), "listed");
+
         let mut manifest = Manifest::from_scan(scanned.files);
 
-        // The cache lives beside the data it describes, so moving a folder takes its
-        // hashes along.
-        let cache_root = if root.is_dir() {
-            root.clone()
-        } else {
-            root.parent().unwrap_or(&root).to_path_buf()
-        };
-        let mut cache = HashCache::open(&cache_root);
-
-        for file in manifest.files_mut() {
-            if !should_hash(file, checksum) {
-                continue;
-            }
-
-            if let Some(known) = cache.get(&file.scanned) {
-                file.hash = Some(known);
-                continue;
-            }
-
-            match hash_file(&file.scanned.absolute) {
-                Ok(hash) => {
-                    cache.insert(&file.scanned, hash);
-                    file.hash = Some(hash);
-                }
-                Err(error) => {
-                    // A file that cannot be hashed can still be sent; the receiver falls
-                    // back to size and mtime for it.
-                    tracing::debug!(
-                        path = %file.scanned.absolute.display(),
-                        %error,
-                        "could not hash before offering"
-                    );
-                }
-            }
+        if prehash {
+            fill_known_hashes(&root, &mut manifest, checksum, cpu_jobs);
         }
 
-        cache.save();
         Ok::<_, crate::scan::manifest::ScanError>((manifest, scanned.unportable))
     })
     .await
     .map_err(joined_error)??;
 
     Ok(scanned)
+}
+
+/// Fills in the hashes the receiver can use to skip files it already has.
+///
+/// Three passes, because each wants something different. The remembered hashes come first
+/// and cost a lookup each - a tree that has been sent before is almost all hits, and that
+/// is the case worth being fast. What is left is hashed on every core the user allowed:
+/// BLAKE3 on one thread was the whole scan on a large tree, with the rest of the machine
+/// idle. The results are then written back and remembered, in one place, by the one owner
+/// of the cache.
+///
+/// Never fails: a file that cannot be hashed is simply offered without one, and the
+/// receiver falls back to size and mtime for it.
+fn fill_known_hashes(root: &Path, manifest: &mut Manifest, checksum: bool, cpu_jobs: NonZeroU32) {
+    // The cache lives beside the data it describes, so moving a folder takes its hashes
+    // along.
+    let cache_root = if root.is_dir() {
+        root.to_path_buf()
+    } else {
+        root.parent().unwrap_or(root).to_path_buf()
+    };
+    let mut cache = HashCache::open(&cache_root);
+
+    let mut to_hash = Vec::new();
+    for (index, file) in manifest.files_mut().iter_mut().enumerate() {
+        if !should_hash(file, checksum) {
+            continue;
+        }
+
+        match cache.get(&file.scanned) {
+            Some(known) => file.hash = Some(known),
+            None => to_hash.push(index),
+        }
+    }
+
+    if to_hash.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        files = to_hash.len(),
+        threads = cpu_jobs.get(),
+        "hashing what the cache does not already know"
+    );
+
+    let files = manifest.files();
+    let hashed: Vec<(usize, [u8; 32])> = on_cores(cpu_jobs, || {
+        to_hash
+            .par_iter()
+            .filter_map(|index| {
+                let path = &files[*index].scanned.absolute;
+                match hash_file(path) {
+                    Ok(hash) => Some((*index, hash)),
+                    Err(error) => {
+                        tracing::debug!(path = %path.display(), %error, "could not hash before offering");
+                        None
+                    }
+                }
+            })
+            .collect()
+    });
+
+    for (index, hash) in hashed {
+        let file = &mut manifest.files_mut()[index];
+        file.hash = Some(hash);
+        cache.insert(&file.scanned, hash);
+    }
+
+    cache.save();
 }
 
 /// Whether this file's hash is worth computing before it is offered.
@@ -589,6 +655,10 @@ async fn build_manifest(
 fn should_hash(file: &ManifestFile, checksum: bool) -> bool {
     checksum || file.scanned.size <= HASH_SIZE_CEILING_BYTES
 }
+
+/// How many manifest batches go by between progress lines. At the default batch size that
+/// is 64,000 files, which on a tree large enough to need it is roughly a line a minute.
+const BATCHES_PER_REPORT: usize = 32;
 
 /// Offers the manifest in batches and collects what the receiver wants.
 async fn negotiate(
@@ -624,6 +694,18 @@ async fn negotiate(
             .await?;
 
         collect_decisions(reader, manifest, batch_seq, &mut needed).await?;
+
+        // One batch is answered before the next is sent, so a large tree spends real time
+        // here with nothing else to show for it. Said periodically rather than per batch:
+        // a line per exchange would be its own kind of silence.
+        if index % BATCHES_PER_REPORT == BATCHES_PER_REPORT - 1 {
+            tracing::info!(
+                batch = index + 1,
+                of = total_batches,
+                wanted = needed.len(),
+                "offering the file list"
+            );
+        }
     }
 
     Ok(needed)

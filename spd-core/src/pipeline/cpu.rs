@@ -7,11 +7,38 @@
 //! Work travels by value, buffers included, and comes back the same way. Nothing is
 //! borrowed across the hop, so nothing has to outlive a task that may be cancelled.
 
+use core::num::NonZeroU32;
 use std::path::PathBuf;
 
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
 
 use crate::pipeline::PipelineError;
+
+/// Runs `work` on a pool of exactly `threads` threads and waits for it.
+///
+/// For the bulk work that happens before a transfer starts, where the caller is already on
+/// a blocking thread and wants the machine's cores rather than one of them. The pool is
+/// built for this call and dropped with it, so `--cpu-jobs` means the same thing here as it
+/// does on the transfer path instead of being whatever rayon's global pool was sized to.
+///
+/// A pool that cannot be built is not a failure: the work runs on the default pool, which
+/// is slower to control but no less correct.
+pub(crate) fn on_cores<T, F>(threads: NonZeroU32, work: F) -> T
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.get() as usize)
+        .build()
+    {
+        Ok(pool) => pool.install(work),
+        Err(error) => {
+            tracing::debug!(%error, "could not size a thread pool; using the default one");
+            work()
+        }
+    }
+}
 
 /// Runs `work` on the CPU pool and waits for its result.
 ///

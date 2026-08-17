@@ -34,6 +34,7 @@ pub(crate) async fn run(args: &RecvArgs) -> Result<()> {
 
     let limits = Limits {
         max_concurrent_streams: streams.get(),
+        max_files: args.max_files,
         names: args.names.into(),
         ..Limits::DEFAULT
     };

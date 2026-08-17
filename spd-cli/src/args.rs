@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use spd_core::pipeline::budget::JobLimits;
 use spd_core::pipeline::retry::RetryPolicy;
+use spd_core::safety::limits::Limits;
 use spd_core::safety::path::NamePolicy;
 
 /// Peer-to-peer file and folder transfer over QUIC.
@@ -107,6 +108,17 @@ pub(crate) struct SendArgs {
     /// Hash every file instead of trusting size and timestamp. Slower, and certain.
     #[arg(long)]
     pub(crate) checksum: bool,
+
+    /// Do not hash anything before offering it. The first copy into an empty destination
+    /// starts moving bytes immediately instead of reading the whole tree twice; a later
+    /// run then has no remembered hashes and compares by size and timestamp.
+    #[arg(long, conflicts_with = "checksum")]
+    pub(crate) no_prehash: bool,
+
+    /// Largest number of files one transfer may carry. Raise it for a tree with millions
+    /// of them, knowing the receiver holds a record per file it accepts.
+    #[arg(long, default_value_t = Limits::DEFAULT.max_files, value_name = "N")]
+    pub(crate) max_files: u64,
 
     /// Follow symlinks while scanning. Off by default: a link can point outside the tree
     /// you meant to send.
@@ -218,6 +230,11 @@ pub(crate) struct RecvArgs {
     /// Hash local files before deciding, instead of trusting size and timestamp.
     #[arg(long)]
     pub(crate) checksum: bool,
+
+    /// Largest number of files one transfer may carry. The sender is refused past this,
+    /// because every accepted file costs a record held until the transfer ends.
+    #[arg(long, default_value_t = Limits::DEFAULT.max_files, value_name = "N")]
+    pub(crate) max_files: u64,
 
     /// How much memory the transfer may hold, in MiB. Concurrency follows from this.
     #[arg(long, default_value_t = 256, value_name = "MIB")]

@@ -116,6 +116,50 @@ async fn a_dry_run_reports_what_the_real_run_then_does() {
     assert_eq!(real.transferred.bytes, planned.planned.bytes);
 }
 
+/// Without pre-hashing, the first copy still arrives byte for byte and no hash cache is
+/// written - the hashes it would hold were never computed. What the receiver checks after
+/// each file is unaffected: that hash is taken from the bytes as they are read.
+#[tokio::test]
+async fn skipping_the_prehash_still_delivers_the_tree_and_leaves_no_cache() {
+    let source = tree("no-prehash-source");
+    let destination = Scratch::new("no-prehash-dest");
+
+    let report = transfer(
+        source.path(),
+        destination.path(),
+        SendOptions {
+            prehash: false,
+            ..SendOptions::default()
+        },
+    )
+    .await;
+
+    assert_eq!(report.transferred.files, 3);
+    assert_eq!(
+        std::fs::read(destination.path().join("notes.txt")).unwrap(),
+        b"first version"
+    );
+    assert!(
+        !source.path().join(".spd").join("hashcache").exists(),
+        "nothing was hashed, so there is nothing to remember"
+    );
+
+    // And a second run still skips what is already there: size and mtime settle it without
+    // a single hash on either side.
+    let second = transfer(
+        source.path(),
+        destination.path(),
+        SendOptions {
+            prehash: false,
+            ..SendOptions::default()
+        },
+    )
+    .await;
+
+    assert_eq!(second.transferred.files, 0);
+    assert_eq!(second.skipped, 3);
+}
+
 #[tokio::test]
 async fn checksum_mode_notices_a_file_that_kept_its_size_and_timestamp() {
     let source = Scratch::new("checksum-source");

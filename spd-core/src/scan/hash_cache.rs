@@ -24,6 +24,9 @@ pub const CACHE_FILE: &str = "hashcache";
 /// user wants certainty rather than speed.
 pub const HASH_SIZE_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Largest read buffer used while hashing one file. A small file gets a small one.
+const HASH_BUF_SIZE_BYTES: u64 = 1024 * 1024;
+
 /// What identifies a cached hash.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct CacheKey {
@@ -131,7 +134,15 @@ fn key_for(file: &ScannedFile) -> CacheKey {
 pub fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
+
+    // Sized to the file rather than fixed. A tree of small files is the common case, and a
+    // megabyte allocated and zeroed for each of two million of them is minutes of work that
+    // hashes nothing.
+    let buffer_bytes = file
+        .metadata()
+        .map_or(HASH_BUF_SIZE_BYTES, |meta| meta.len())
+        .clamp(1, HASH_BUF_SIZE_BYTES);
+    let mut buffer = vec![0_u8; usize::try_from(buffer_bytes).unwrap_or(usize::MAX)];
 
     loop {
         let read = file.read(&mut buffer)?;

@@ -271,6 +271,61 @@ async fn a_unix_only_name_is_held_back_when_the_receiver_cannot_write_it() {
     );
 }
 
+/// The sender knows how many files it found before it offers any of them, so a tree past
+/// the limit is refused there - not a thousand manifest batches later by the receiver.
+#[tokio::test]
+async fn a_tree_past_the_file_limit_is_refused_before_anything_is_offered() {
+    let source = Scratch::new("too-many-source");
+    for index in 0..4 {
+        source.write(&format!("file-{index}.bin"), b"x");
+    }
+
+    let destination = Scratch::new("too-many-dest");
+    let limits = Limits {
+        max_files: 3,
+        ..Limits::DEFAULT
+    };
+    let (listener, address) = bound_listener(limits);
+    let into = destination.path().to_path_buf();
+
+    let receiving = tokio::spawn(async move {
+        let session = listener.accept().await.unwrap();
+        receive_tree(session, &into, ReceiveOptions::default(), &limits).await
+    });
+
+    let sender = dial(address, limits).await;
+    let refused = spd_core::pipeline::send::send_tree(
+        sender,
+        source.path(),
+        spd_core::pipeline::send::SendOptions::default(),
+        &limits,
+    )
+    .await
+    .expect_err("four files should not be offered under a limit of three");
+
+    assert!(
+        matches!(
+            refused,
+            PipelineError::TooManyFiles {
+                limit: "max_files",
+                max: 3
+            }
+        ),
+        "got {refused:?}"
+    );
+
+    // The receiver is left waiting for a manifest that never comes; dropping the sender
+    // ends its session, and what it returns is not the subject here.
+    let _ = receiving.await;
+    assert!(
+        std::fs::read_dir(destination.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "a refusal before the offer leaves the destination untouched"
+    );
+}
+
 #[tokio::test]
 async fn an_ordinary_nested_path_is_still_accepted() {
     let source = Scratch::new("traversal-ok-source");

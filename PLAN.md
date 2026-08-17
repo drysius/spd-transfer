@@ -580,6 +580,23 @@ Shipped: `NamePolicy` in `safety/path.rs`, `Limits::names`, the feature bit, `--
 both sides allow it, and is held back when only the sender does. The wire format did not
 move: the golden files are unchanged.
 
+### F11 - Large trees - **done**
+Measured on a real one: 2,546,201 files and 140 GB under `pterodactyl/volumes`. Ten and a
+half minutes before a byte moved, 3.8 GB resident, one core at 100% and the rest idle, and
+then a refusal, because the tree is past `max_files`.
+Four causes, four fixes. The pre-hash read and hashed all 140 GB to work out what the
+receiver already had, which on a first copy is the answer "nothing" bought at the price of
+reading everything: `--no-prehash` skips it. Hashing ran in one loop on one thread: it now
+runs on `--cpu-jobs` cores through a pool sized for the call, so the knob means the same
+thing here as on the transfer path. `hash_file` allocated and zeroed a megabyte per file,
+which over two million small files is minutes spent hashing nothing: the buffer is now sized
+to the file. And `max_files` was a constant no user could reach past - it is `--max-files` on
+both sides, with the sender refusing its own oversized tree straight after the scan instead
+of a thousand manifest batches later.
+The manifest is still built whole in memory before anything is offered, at roughly 1.5 KB
+per file. That is the next thing to fix and it is a redesign, not a flag; until then a tree
+of millions of files wants splitting, and the sender says so with a limit it names.
+
 ---
 
 ## 11. Test strategy

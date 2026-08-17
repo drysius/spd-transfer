@@ -19,6 +19,30 @@ Dates are the day the work was finished.
   `..`, separators, control characters and the depth and length limits are refused under
   either setting.
 
+- **`--no-prehash`, for a first copy.** Before offering a tree, the sender hashed every file
+  under 1 GiB so the receiver could skip what it already had. On a folder being synchronised
+  again that is the whole point. On a first copy into an empty destination it reads and
+  hashes the entire dataset to establish that the receiver has nothing - on a 140 GB tree,
+  ten minutes before a single byte moved. `--no-prehash` starts sending immediately; a later
+  run then compares by size and timestamp instead of by content.
+
+- **`--max-files`, on both sides.** It was a fixed million. A tree past it can now be sent by
+  raising it, and the sender refuses its own oversized tree right after the scan, naming the
+  flag - instead of the receiver ending the session a thousand manifest batches later.
+
+### Changed
+
+- **Hashing before a transfer uses every core it was given.** It ran in one loop on one
+  thread while the rest of the machine sat idle; it now runs across `--cpu-jobs` threads.
+  The read buffer is also sized to the file rather than a megabyte per file, which on a tree
+  of millions of small files was minutes spent allocating and zeroing memory that hashed
+  nothing.
+
+- **A large tree says what it is doing.** The scan logs the file count as soon as the walk
+  ends, says how many files it is about to hash, and reports progress while the file list is
+  being offered. Previously a tree of two million files showed `0 B/0 B  0/0 files` for as
+  long as it took, which is indistinguishable from a hang.
+
 ### Fixed
 
 - **A live tree no longer fails the whole transfer.** A file that existed when the directory
@@ -37,6 +61,16 @@ Dates are the day the work was finished.
   command line is still a refusal: there the user pointed at that one file and nothing else.
 
 ### Known, not yet fixed
+
+- **The whole file list is held in memory before anything is offered**, at roughly 1.5 KB per
+  file: 2.5 million files cost about 3.8 GB on the sending side, and the memory budget does
+  not cover it - `--mem-budget-mb` sizes the transfer buffers, nothing else. Splitting a tree
+  that large into several transfers is the workaround; a streaming manifest is the fix, and
+  it is a redesign rather than a flag.
+
+- **The file list is offered one batch at a time**, each waiting for its answer before the
+  next goes out. At 2,000 files per batch, a million files is 500 round trips before the
+  first byte moves - a second on a LAN, a minute on a link with 100 ms of latency.
 
 - **Throughput is capped by QUIC's default flow-control windows**, not by the link. quinn
   sizes them for a 100 ms round trip and 12.5 MB/s per stream: 1.25 MB per stream, 10 MB
