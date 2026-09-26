@@ -8,12 +8,15 @@ exclude = ["spd-fuzz/fuzz"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88 because `time` only fixed RUSTSEC-2026-0009 from 0.3.47, which needs it.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Drysius/spd-transfer"
 
 [workspace.dependencies]
-spd-core = { path = "spd-core" }
+# The version is redundant for a path dependency, but a dependency without one is a
+# wildcard, and `cargo deny` refuses wildcards.
+spd-core = { path = "spd-core", version = "0.1.0" }
 anyhow = "1"
 blake3 = "1"
 bytes = "1"
@@ -25,7 +28,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 getrandom = "0.3"
 indicatif = "0.18"
 jwalk = "0.8"
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 proptest = "1"
 # ring rather than aws-lc-rs: it builds without cmake/nasm, which keeps the Windows
 # leg of the CI matrix from needing extra toolchain setup.
