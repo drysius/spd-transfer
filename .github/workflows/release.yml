@@ -102,8 +102,10 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # A git tag cannot hold a space, so the tag is hyphenated and the release is named
-      # the way it was asked for. Both carry the same commit, which is the point of either.
+      # The version is the day the release is published plus a counter: v25.09.2026.0 is
+      # the first release of 25 September 2026, v25.09.2026.1 the second that day. The
+      # counter is read back from the tags that already exist for that day, so it needs no
+      # state kept in the repository and a deleted release simply frees its number.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -111,13 +113,21 @@ jobs:
         run: |
           set -euo pipefail
           short="${SHA:0:7}"
+          today=$(date --utc +%d.%m.%Y)
+
+          # Highest counter already used today, or -1 when today has no release yet.
+          last=$(gh release list --limit 200 --json tagName --jq \
+                   ".[].tagName | select(startswith(\"v${today}.\")) | split(\".\")[3]" \
+                 | sort --numeric-sort | tail -1)
+          version="v${today}.$(( ${last:--1} + 1 ))"
+
           # HEAD is the commit checked out above, which is the one ci ran on.
           subject=$(git log -1 --pretty=%s)
 
           {
             echo "$subject"
             echo
-            echo "Built from \`$SHA\`."
+            echo "Built from \`$SHA\` (\`$short\`)."
             echo
             echo "| File | For |"
             echo "|---|---|"
@@ -127,8 +137,8 @@ jobs:
             echo "| \`spd-aarch64-apple-darwin.tar.gz\` | macOS, Apple silicon |"
           } > notes.md
 
-          gh release create "build-v${short}" \
-            --title "build v${short}" \
+          gh release create "$version" \
+            --title "$version" \
             --notes-file notes.md \
             --target "$SHA" \
             dist/*

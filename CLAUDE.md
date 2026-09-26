@@ -24,9 +24,10 @@ cargo run -p spd-cli -- doctor
 CI runs `cargo xtask ci` on Linux, Windows and macOS, plus `cargo-deny` and a check that
 `spd-core` pulled in no UI dependency.
 
-`release.yml` runs after a green `ci` on `main` and publishes `build v<short sha>`, with
-binaries for Linux (glibc and static musl), Windows and macOS. Several commits pushed
-together produce one release, for the last of them.
+`release.yml` runs after a green `ci` on `main` and publishes `v<DD>.<MM>.<YYYY>.<n>` -
+the day it was published plus a counter that restarts each day, so the second release of
+25 September 2026 is `v25.09.2026.1`. Binaries for Linux (glibc and static musl), Windows
+and macOS. Several commits pushed together produce one release, for the last of them.
 
 ## Rules
 
