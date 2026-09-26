@@ -282,9 +282,9 @@ fn default_listen_address() -> SocketAddr {
 /// The core count is not a constant, so it cannot live in `JobLimits::DEFAULT`; this is
 /// where the program finds out what machine it is on.
 fn default_cpu_jobs() -> u32 {
-    std::thread::available_parallelism()
-        .map(|cores| u32::try_from(cores.get()).unwrap_or(u32::MAX))
-        .unwrap_or(JobLimits::DEFAULT.cpu_jobs.get())
+    std::thread::available_parallelism().map_or(JobLimits::DEFAULT.cpu_jobs.get(), |cores| {
+        u32::try_from(cores.get()).unwrap_or(u32::MAX)
+    })
 }
 
 /// Options for `spd doctor`.
