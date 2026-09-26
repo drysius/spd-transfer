@@ -1,2 +1,4 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Every text file is LF in the repository and LF in the working tree, on every platform.
+# `eol=lf` is the part that matters: without it a Windows checkout gets CRLF, and
+# `cargo fmt --check` fails the whole build on `newline_style = "Unix"`.
+* text=auto eol=lf
